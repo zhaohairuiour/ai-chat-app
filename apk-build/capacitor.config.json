@@ -1,0 +1,8 @@
+{
+  "appId": "com.aichat.app",
+  "appName": "AI Chat App",
+  "webDir": "www",
+  "android": {
+    "allowMixedContent": true
+  }
+}

@@ -1,0 +1,33 @@
+# ===== 二进制发布产物（APK 走 GitHub Release 附件，不进仓库）=====
+*.apk
+*.zip
+*.db
+
+# ===== 依赖目录 =====
+node_modules/
+
+# ===== Android 构建中间产物 =====
+apk-build/android/app/build/
+apk-build/android/build/
+apk-build/android/.gradle/
+apk-build/android/.kotlin/
+apk-build/android/capacitor-cordova-android-plugins/build/
+apk-build/android/app/.cxx/
+
+# ===== Capacitor 同步工作副本（由 py_project/public 重建）=====
+apk-build/www/
+
+# ===== 运行时数据 =====
+**/data/
+
+# ===== 历史备份与临时文件 =====
+server.js.bak-*
+server.js.standalone
+.tmp-tool-results/
+*.xml
+
+# ===== 本地环境与密钥 =====
+.env
+.env.*
+*.local
+~/.gh_token

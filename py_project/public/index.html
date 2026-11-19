@@ -1,0 +1,368 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+  <title>AI 助手</title>
+  <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+  <link rel="apple-touch-icon" href="/favicon.svg" />
+  <link rel="stylesheet" href="/style.css?v=3.32.99" />
+  <link rel="stylesheet" href="/vendor/github-dark.min.css" />
+  <script src="/vendor/marked.min.js"></script>
+  <script src="/vendor/highlight.min.js"></script>
+</head>
+<body>
+  <!-- 登录/注册 -->
+  <div id="auth-screen" class="auth-screen hidden">
+    <div class="auth-card">
+      <div class="auth-logo"><svg class="icon" viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3l1.9 5.8 5.8 1.9-5.8 1.9L12 18.5l-1.9-5.9L4.3 10.7l5.8-1.9L12 3z"/><path d="M19 15l.9 2.6 2.6.9-2.6.9L19 22l-.9-2.6-2.6-.9 2.6-.9L19 15z"/></svg> AI 助手</div>
+      <div class="auth-tabs">
+        <button class="auth-tab active" data-mode="login">登录</button>
+        <button class="auth-tab" data-mode="register">注册</button>
+      </div>
+      <form id="auth-form">
+        <input type="text" id="auth-username" placeholder="用户名或邮箱" autocomplete="username" required />
+        <input type="email" id="auth-email" placeholder="邮箱（注册必填，用于接收验证码）" class="hidden" autocomplete="email" />
+        <div class="field-hint hidden" id="auth-email-hint"></div>
+        <input type="password" id="auth-password" placeholder="密码" autocomplete="current-password" required />
+        <input type="password" id="auth-password2" placeholder="确认密码（注册时填）" class="hidden" autocomplete="new-password" />
+        <div class="field-hint hidden" id="auth-pwd-hint"></div>
+        <!-- 注册：邮箱验证码 -->
+        <div class="code-row hidden" id="reg-code-row">
+          <input type="text" id="auth-code" placeholder="6 位邮箱验证码" inputmode="numeric" maxlength="6" autocomplete="one-time-code" />
+          <button type="button" class="code-btn" id="btn-send-code">发送验证码</button>
+        </div>
+        <div class="auth-error" id="auth-error"></div>
+        <button type="submit" class="btn-primary" id="auth-submit">登 录</button>
+        <!-- 登录：邮箱验证码快捷登录 -->
+        <div class="mail-login" id="mail-login">
+          <div class="mail-login-divider"><span>或使用邮箱验证码登录</span></div>
+          <input type="email" id="mail-login-email" placeholder="已绑定邮箱（验证码登录）" autocomplete="email" />
+          <div class="code-row">
+            <input type="text" id="mail-login-code" placeholder="6 位邮箱验证码" inputmode="numeric" maxlength="6" autocomplete="one-time-code" />
+            <button type="button" class="code-btn" id="btn-send-login-code">发送验证码</button>
+          </div>
+          <button type="button" class="btn-primary btn-mail-login" id="btn-mail-login">验证码登录</button>
+        </div>
+        <button type="button" class="guest-btn hidden" id="btn-guest">使用本地账号进入</button>
+      </form>
+    </div>
+  </div>
+
+  <div id="app" class="app hidden">
+    <div id="sidebar-mask" class="sidebar-mask"></div>
+
+    <aside class="sidebar" id="sidebar">
+      <div class="sidebar-header">
+        <div class="brand"><svg class="icon" viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3l1.9 5.8 5.8 1.9-5.8 1.9L12 18.5l-1.9-5.9L4.3 10.7l5.8-1.9L12 3z"/><path d="M19 15l.9 2.6 2.6.9-2.6.9L19 22l-.9-2.6-2.6-.9 2.6-.9L19 15z"/></svg> AI 助手</div>
+        <button class="new-chat-btn" id="btn-new-chat"><svg class="icon" viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg> 新对话</button>
+      </div>
+
+      <div class="model-block">
+        <!-- 自定义模型选择器（智谱官网风格、方形圆角；非浏览器原生下拉） -->
+        <div class="model-picker" id="model-picker-side"></div>
+        <div class="status-info">
+          <div class="endpoint-line"><span class="dot" id="endpoint-dot"></span><span id="endpoint-text">连接中…</span></div>
+        </div>
+      </div>
+
+      <div class="conv-section-title">对话历史</div>
+      <div class="conv-list" id="conv-list"></div>
+
+      <div class="sidebar-footer">
+        <div class="user-row">
+          <div class="avatar" id="user-avatar">?</div>
+          <div class="user-meta">
+            <div class="nickname" id="user-nickname">--</div>
+            <div class="username" id="user-username">--</div>
+          </div>
+        </div>
+        <div class="email-line" id="user-email">未绑定邮箱</div>
+        <div class="auth-line" id="auth-line"></div>
+        <div class="spend-line hidden" id="spend-line"></div>
+        <div class="ban-info-line hidden" id="ban-info-line"></div>
+        <button class="ghost-btn" id="btn-login">登录 / 注册</button>
+        <button class="ghost-btn" id="btn-bind-email"><svg class="icon" viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/></svg> 绑定邮箱</button>
+        <button class="ghost-btn" id="btn-edit-profile">编辑昵称</button>
+        <button class="ghost-btn" id="btn-deactivate"><svg class="icon" viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="10"/><line x1="15" y1="9" x2="9" y2="15"/><line x1="9" y1="9" x2="15" y2="15"/></svg> 注销账号</button>
+        <button class="ghost-btn" id="btn-settings"><svg class="icon" viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg> 设置</button>
+        <button class="ghost-btn" id="btn-logout">退出登录</button>
+      </div>
+    </aside>
+
+    <!-- 设置模态框 -->
+    <div class="settings-modal hidden" id="settings-modal">
+      <div class="settings-panel">
+        <div class="settings-head">
+          <span>设置</span>
+          <button class="settings-close" id="settings-close">✕</button>
+        </div>
+        <div class="settings-body">
+          <div class="settings-section">
+            <div class="settings-label">沙箱运行模式</div>
+            <div class="settings-desc">原生 Linux = Termux 直接运行；Proot = 完整 Linux 发行版（需首次下载约 50MB）</div>
+            <div class="settings-radio-group">
+              <label class="settings-radio"><input type="radio" name="sandbox-mode" value="native" checked> 原生 Linux（Termux）</label>
+              <label class="settings-radio"><input type="radio" name="sandbox-mode" value="proot"> Proot Linux</label>
+            </div>
+            <button class="settings-btn" id="btn-install-proot">安装 Proot 环境</button>
+          </div>
+          <div class="settings-section">
+            <div class="settings-label">AI 自动执行命令</div>
+            <div class="settings-desc">开启后，AI 回复中的 bash/sh 代码块将自动在沙箱中执行</div>
+            <label class="settings-toggle"><input type="checkbox" id="setting-auto-exec" checked><span class="toggle-slider"></span></label>
+          </div>
+          <div class="settings-section">
+            <div class="settings-label">终端字体大小</div>
+            <input type="range" id="setting-term-font" min="11" max="18" value="13">
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <main class="main">
+      <div id="backend-banner" class="backend-banner hidden">
+        <svg class="icon" viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" style="vertical-align:-2px;margin-right:4px"><path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>后端服务已断开，请回到终端执行 <code>npm start</code> 启动
+      </div>
+      <header class="top-bar">
+        <button class="menu-btn" id="btn-menu" title="菜单"><svg class="icon" viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><line x1="3" y1="6" x2="21" y2="6"/><line x1="3" y1="12" x2="21" y2="12"/><line x1="3" y1="18" x2="21" y2="18"/></svg></button>
+        <div class="chat-title" id="chat-title">新的对话</div>
+        <button class="new-topic-btn" id="btn-new-topic" title="开启新话题"><svg class="icon" viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg> 新话题</button>
+      </header>
+
+      <!-- 欢迎语（无消息时显示） -->
+      <div class="messages" id="messages">
+        <div class="welcome" id="welcome">
+          <div class="welcome-logo"><svg class="icon" viewBox="0 0 24 24" width="48" height="48" fill="none" stroke="#3078f6" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3l1.9 5.8 5.8 1.9-5.8 1.9L12 18.5l-1.9-5.9L4.3 10.7l5.8-1.9L12 3z"/><path d="M19 15l.9 2.6 2.6.9-2.6.9L19 22l-.9-2.6-2.6-.9 2.6-.9L19 15z"/></svg></div>
+          <h1>你好，我是 AI 助手</h1>
+          <p>有什么可以帮你的？选择下方技能，或直接输入问题开始对话。</p>
+        </div>
+      </div>
+
+      <!-- 回到底部：固定悬浮，脱离消息滚动区，滑到底自动隐藏 -->
+      <button class="scroll-down-btn hidden" id="scroll-down-btn" title="回到底部">
+        <svg class="icon" viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><line x1="12" y1="3" x2="12" y2="19"/><polyline points="5 12 12 19 19 12"/></svg>
+      </button>
+
+      <div class="composer">
+        <!-- 技能区 -->
+        <div class="skill-bar" id="skill-bar"></div>
+        <!-- 工具栏：token档位（仅快速可用）+ 模型 + 节点 + 联网 -->
+        <div class="tool-row">
+          <div class="model-picker tool" id="model-picker-tool" title="切换模型"></div>
+          <div class="node-picker" id="node-picker" title="切换接入节点（智谱模型直连，无需节点）"></div>
+          <!-- 深度搜索：深度思考 + 强制联网（仅智谱思考模型可用） -->
+          <button type="button" class="deep-toggle" id="btn-deep-toggle" title="深度搜索：深度思考 + 强制联网（仅智谱模型）">
+            <svg class="icon" viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="11" cy="11" r="7"/><line x1="21" y1="21" x2="16.65" y2="16.65"/><line x1="11" y1="8" x2="11" y2="14"/><line x1="8" y1="11" x2="14" y2="11"/></svg> 深度
+          </button>
+          <!-- 三态开关：auto(自动) / on(强制联网) / off(关闭联网)；点一次循环切下一档 -->
+          <button type="button" class="web-toggle mode-auto" id="auto-web-toggle" title="点击切换联网模式">自动联网</button>
+        </div>
+
+        <!-- 技能动态表单（点技能后展开；字段随技能定义动态生成） -->
+        <div class="input-row skill-form-row hidden" id="skill-form-row">
+          <div class="skill-form-wrap">
+            <button class="skill-close" id="skill-close" title="取消，返回普通输入"><svg class="icon" viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg></button>
+            <div class="skill-form-title" id="skill-form-title">技能</div>
+            <div class="skill-form-body" id="skill-form-body"></div>
+          </div>
+          <button class="send-btn" id="btn-skill-send" title="发送"><svg class="icon" viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><line x1="12" y1="19" x2="12" y2="5"/><polyline points="5 12 12 5 19 12"/></svg></button>
+        </div>
+
+        <!-- 附件区（仅智谱多模态模型可用） -->
+        <div class="attach-chips hidden" id="attach-chips"></div>
+        <div class="attach-panel hidden" id="attach-panel">
+          <button type="button" data-kind="camera">拍照上传</button>
+          <button type="button" data-kind="image">上传图片</button>
+          <button type="button" data-kind="doc">上传文件</button>
+          <button type="button" data-kind="audio">上传语音</button>
+          <button type="button" data-kind="url">粘贴链接</button>
+        </div>
+        <input type="file" id="attach-file-image" accept="image/*" hidden />
+        <input type="file" id="attach-file-doc" accept=".txt,.pdf,.md,.csv,.json,.html,.htm,.js,.py,.xml" hidden />
+        <input type="file" id="attach-file-audio" accept="audio/*,.wav,.mp3,.m4a,.aac,.ogg" hidden />
+
+        <!-- 普通输入行 -->
+        <div class="input-row" id="input-row">
+          <button class="attach-btn" id="btn-attach" title="添加图片/视频/文件/语音（仅智谱多模态模型）">
+            <svg class="icon" viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/></svg>
+          </button>
+          <button class="oc-quick-btn" id="oc-quick-settings" title="设置 OpenClaw（记忆 / 工作区 / 模型）">设置 OpenClaw</button>
+          <textarea id="input" rows="1" placeholder="发消息…"></textarea>
+          <button class="send-btn stop-btn hidden" id="btn-stop-gen" title="停止生成"><svg class="icon" viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" aria-hidden="true"><rect x="6" y="6" width="12" height="12" rx="2"/></svg></button>
+          <button class="send-btn" id="btn-send" title="发送"><svg class="icon" viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><line x1="12" y1="19" x2="12" y2="5"/><polyline points="5 12 12 5 19 12"/></svg></button>
+        </div>
+      </div>
+    </main>
+  </div>
+
+  <!-- 网站内嵌提示（替代浏览器原生 alert / prompt / confirm） -->
+  <div class="toast-wrap" id="toast-wrap"></div>
+
+  <div class="app-modal hidden" id="app-modal">
+    <div class="app-modal-card">
+      <h3 class="app-modal-title" id="am-title"></h3>
+      <p class="app-modal-msg" id="am-msg"></p>
+      <input type="text" class="app-modal-input hidden" id="am-input" />
+      <div class="app-modal-error" id="am-error"></div>
+      <div class="app-modal-actions">
+        <button class="btn-modal-ghost" id="am-cancel">取 消</button>
+        <button class="btn-primary app-modal-confirm" id="am-ok">确 定</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 摄像头拍照弹窗 -->
+  <div class="camera-modal hidden" id="camera-modal">
+    <div class="camera-card">
+      <div class="camera-view">
+        <video id="camera-video" autoplay playsinline muted></video>
+        <canvas id="camera-canvas" hidden></canvas>
+        <img id="camera-preview" alt="拍摄预览" hidden />
+        <canvas id="camera-edit" class="hidden"></canvas>
+        <p class="camera-hint hidden" id="camera-hint"></p>
+      </div>
+      <div class="camera-tools hidden" id="camera-tools">
+        <button type="button" class="cam-color active" data-color="#ef4444">红</button>
+        <button type="button" class="cam-color" data-color="#fbbf24">黄</button>
+        <button type="button" class="cam-color" data-color="#38bdf8">蓝</button>
+        <button type="button" class="cam-color" data-color="#ffffff">白</button>
+        <button type="button" class="cam-tool" id="cam-undo">撤销</button>
+        <button type="button" class="cam-tool" id="cam-clear">清空</button>
+      </div>
+      <div class="camera-actions">
+        <button type="button" class="cam-btn ghost" id="cam-cancel">取消</button>
+        <button type="button" class="cam-btn shutter" id="cam-shutter" title="拍照">
+          <svg viewBox="0 0 24 24" width="26" height="26" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z"/><circle cx="12" cy="13" r="4"/></svg>
+        </button>
+        <button type="button" class="cam-btn ghost hidden" id="cam-retake">重拍</button>
+        <button type="button" class="cam-btn primary hidden" id="cam-use">使用照片</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 页面级启动进度（与终端内的 #term-progress 互斥显示，避免出现两条动画） -->
+  <div class="boot-progress hidden" id="boot-progress">
+    <div class="boot-progress-label" id="boot-progress-label">正在准备运行环境…</div>
+    <div class="boot-progress-track"><div class="boot-progress-fill" id="boot-progress-fill"></div></div>
+  </div>
+
+  <!-- OpenClaw 设置 -->
+  <div class="modal-mask hidden" id="oc-settings-modal">
+    <div class="modal-card oc-settings-card">
+      <h3 class="modal-title">OpenClaw 设置</h3>
+      <p class="modal-sub" id="oc-settings-path">读取中…</p>
+
+      <div class="oc-section">
+        <label class="oc-label" for="oc-agent-model">Agent 执行模型</label>
+        <select id="oc-agent-model"></select>
+      </div>
+
+      <div class="oc-section">
+        <div class="oc-row">
+          <span>记忆占用</span>
+          <span id="oc-mem-size" class="oc-muted">—</span>
+        </div>
+        <button type="button" class="oc-btn danger" id="oc-mem-clear">清空记忆</button>
+      </div>
+
+      <div class="oc-section">
+        <label class="oc-label" for="oc-file-select">工作区文件</label>
+        <select id="oc-file-select">
+          <option value="AGENTS.md">AGENTS.md（行为规范）</option>
+          <option value="USER.md">USER.md（用户偏好）</option>
+          <option value="SOUL.md">SOUL.md（人格设定）</option>
+          <option value="IDENTITY.md">IDENTITY.md（身份）</option>
+          <option value="MEMORY.md">MEMORY.md（长期记忆）</option>
+        </select>
+        <textarea id="oc-file-body" rows="8" placeholder="该文件为空"></textarea>
+      </div>
+
+      <div class="oc-section">
+        <label class="oc-label" for="oc-config-body">openclaw.json（原始配置，需合法 JSON）</label>
+        <textarea id="oc-config-body" rows="6" placeholder="{ }"></textarea>
+      </div>
+
+      <div class="oc-actions">
+        <button type="button" class="oc-btn ghost" id="oc-settings-cancel">取消</button>
+        <button type="button" class="oc-btn primary" id="oc-settings-save">保存</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 绑定邮箱弹窗 -->
+  <div id="email-modal" class="modal-mask hidden">
+    <div class="modal-card">
+      <h3 class="modal-title">绑定邮箱</h3>
+      <p class="modal-sub">输入邮箱与登录密码，确认身份后完成绑定。</p>
+      <input type="email" id="bind-email-input" placeholder="邮箱地址" autocomplete="email" />
+      <input type="password" id="bind-password-input" placeholder="登录密码" autocomplete="current-password" />
+      <div class="modal-error" id="bind-error"></div>
+      <div class="modal-actions">
+        <button class="btn-modal-ghost" id="btn-bind-cancel">取 消</button>
+        <button class="btn-primary modal-confirm" id="btn-bind-confirm">确认绑定</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 浮动终端按钮（仅 APK 内显示） -->
+  <button class="term-fab hidden" id="term-fab" title="终端">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></svg>
+  </button>
+
+  <!-- 全屏终端模态框 -->
+  <div class="term-modal hidden" id="term-modal">
+    <div class="term-modal-head">
+      <div class="term-modal-title">
+        <svg class="icon" viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></svg>
+        本地终端（Termux）
+      </div>
+      <div class="term-head-actions">
+        <button class="term-new-tab" id="term-new-tab" title="新建终端窗口">+ 窗口</button>
+        <button class="term-reinstall-btn" id="term-reinstall" title="清空并重装终端环境">重装</button>
+        <button class="term-modal-close" id="term-modal-close">✕</button>
+      </div>
+    </div>
+    <!-- 多窗口标签 -->
+    <div class="term-tabs" id="term-tabs"></div>
+    <!-- 首次解压进度条（原生 progress 事件驱动，非文字刷屏） -->
+    <div class="boot-progress hidden" id="term-progress">
+      <div class="boot-progress-label" id="term-progress-label">正在解压 OpenClaw 运行时</div>
+      <div class="boot-progress-track"><div class="boot-progress-fill" id="term-progress-fill"></div></div>
+    </div>
+    <div class="term-modal-body" id="term-modal-body"></div>
+    <!-- 控制键栏 -->
+    <div class="term-keys">
+      <button class="tk" data-k="ESC">ESC</button>
+      <button class="tk" data-k="TAB">TAB</button>
+      <button class="tk toggle" data-k="CTRL">CTRL</button>
+      <button class="tk toggle" data-k="ALT">ALT</button>
+      <button class="tk toggle" data-k="SHIFT">SHIFT</button>
+      <span class="tk-sep"></span>
+      <button class="tk" data-k="UP">↑</button>
+      <button class="tk" data-k="DOWN">↓</button>
+      <button class="tk" data-k="LEFT">←</button>
+      <button class="tk" data-k="RIGHT">→</button>
+      <span class="tk-sep"></span>
+      <button class="tk" data-k="HOME">HOME</button>
+      <button class="tk" data-k="END">END</button>
+      <button class="tk" data-k="PGUP">PGUP</button>
+      <button class="tk" data-k="PGDN">PGDN</button>
+    </div>
+    <div class="term-stop-row hidden" id="term-stop-row">
+      <button class="term-stop-btn" id="term-stop-btn" type="button">
+        <svg class="icon" viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="6" y="6" width="12" height="12" rx="2"/></svg>
+        结束命令 (Ctrl+C)
+      </button>
+    </div>
+    <div class="term-modal-input-row">
+      <span class="prompt">$</span>
+      <input type="text" id="term-modal-input" placeholder="输入命令，回车执行" autocomplete="off" autocapitalize="off" spellcheck="false">
+    </div>
+  </div>
+
+  <script src="/local-core.js?v=3.32.99"></script>
+  <script>window.__APP_VER="3.32.99";</script>
+  <script src="/app.js?v=3.32.99"></script>
+</body>
+</html>
