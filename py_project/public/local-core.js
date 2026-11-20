@@ -25,8 +25,27 @@ const AGNES_BASE = 'https://api.agnes.ai/v1';
 const BACKEND_BASE = '';
 // API 代理地址（避免 WebView CORS，所有模型请求走后端转发）
 const PROXY_BASE = BACKEND_BASE + '/api/proxy/chat';
-// 应用内置密钥材料（AES-GCM 加密 + HMAC 签名 + 特殊编码 XOR 密钥流）
-const APP_SECRET_HEX = '9d863a2d9f3c098076bf0d7ebba20c0eebc259dd1849a938e1fb226af466b2190b3f95b48842ca84fccb2837a9cd4c7b1597e00b0009a19629f556e0b554d619';
+// 本地数据加密密钥（AES-GCM + HMAC）：每台设备首次运行时随机生成 64 字节并持久化，
+// APK 内不再内置固定密钥。LEGACY_SECRET_HEX 仅在解密升级前的历史数据时用作兼容回退，
+// 新旧数据读取成功后会自动用设备密钥重新加密（迁移）。
+const LEGACY_SECRET_HEX = '9d863a2d9f3c098076bf0d7ebba20c0eebc259dd1849a938e1fb226af466b2190b3f95b48842ca84fccb2837a9cd4c7b1597e00b0009a19629f556e0b554d619';
+const LS_APP_SECRET = 'aichat-app-secret';
+let _appSecretHex = null;
+function appSecretHex() {
+  if (_appSecretHex) return _appSecretHex;
+  try {
+    let s = localStorage.getItem(LS_APP_SECRET);
+    if (!s || !/^[0-9a-f]{128}$/i.test(s)) {
+      const b = crypto.getRandomValues(new Uint8Array(64));
+      s = Array.from(b, x => x.toString(16).padStart(2, '0')).join('');
+      localStorage.setItem(LS_APP_SECRET, s);
+    }
+    _appSecretHex = s.toLowerCase();
+  } catch (_) {
+    _appSecretHex = LEGACY_SECRET_HEX;   // localStorage 不可用的极端情形，保证功能可用
+  }
+  return _appSecretHex;
+}
 const XOR_SEED = [0x5a, 0x3c, 0x91, 0xe7, 0x28, 0xb4, 0x6d, 0xf0, 0x13, 0x7a, 0xc5, 0x82, 0x49, 0xde, 0x36, 0xab];
 
 // ============ 工具：hex / bytes ============
@@ -102,13 +121,32 @@ function specialDecode(str) {
 }
 
 // ============ Web Crypto 密钥（AES-GCM + HMAC） ============
-let _aesKey = null, _hmacKey = null;
+let _aesKey = null, _hmacKey = null, _legacyAes = null, _legacyHmac = null;
+async function importKeys(hex) {
+  const km = hexToBytes(hex);
+  const aes = await crypto.subtle.importKey('raw', km.slice(0, 32), { name: 'AES-GCM' }, false, ['encrypt', 'decrypt']);
+  const hmac = await crypto.subtle.importKey('raw', km.slice(32, 64), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign', 'verify']);
+  return { aes, hmac };
+}
 async function cryptoKeys() {
   if (_aesKey && _hmacKey) return { aes: _aesKey, hmac: _hmacKey };
-  const km = hexToBytes(APP_SECRET_HEX);
-  _aesKey = await crypto.subtle.importKey('raw', km.slice(0, 32), { name: 'AES-GCM' }, false, ['encrypt', 'decrypt']);
-  _hmacKey = await crypto.subtle.importKey('raw', km.slice(32, 64), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign', 'verify']);
-  return { aes: _aesKey, hmac: _hmacKey };
+  const k = await importKeys(appSecretHex());
+  _aesKey = k.aes; _hmacKey = k.hmac;
+  return k;
+}
+// 旧版内置密钥：仅用于兼容解密升级前的数据
+async function legacyKeys() {
+  if (_legacyAes && _legacyHmac) return { aes: _legacyAes, hmac: _legacyHmac };
+  const k = await importKeys(LEGACY_SECRET_HEX);
+  _legacyAes = k.aes; _legacyHmac = k.hmac;
+  return k;
+}
+async function verifyAndDecrypt(keys, iv, ct, sigInput, sig) {
+  try {
+    const ok = await crypto.subtle.verify('HMAC', keys.hmac, sig, sigInput);
+    if (!ok) return null;
+    return await crypto.subtle.decrypt({ name: 'AES-GCM', iv }, keys.aes, ct);
+  } catch (_) { return null; }
 }
 
 // ============ 信封：加密 + 签名 ============
@@ -130,22 +168,22 @@ async function sealEnvelope(obj) {
     sig: specialEncode(sig),
   });
 }
-// 信封字符串 → 验签 + 解密；任一失败抛异常
+// 信封字符串 → 验签 + 解密；当前设备密钥失败时回退旧内置密钥（兼容历史数据，成功后自动重新加密）
+let _needsRekey = false;
 async function openEnvelope(envStr) {
   const env = JSON.parse(envStr);
   if (!env || env.enc !== 'A256GCM-HMAC' || !env.iv || !env.data || !env.sig) throw new Error('bad envelope');
-  const { aes, hmac } = await cryptoKeys();
   const iv = specialDecode(env.iv);
   const ct = specialDecode(env.data);
   const sig = specialDecode(env.sig);
   const sigInput = new Uint8Array(iv.length + ct.length);
   sigInput.set(iv, 0); sigInput.set(ct, iv.length);
-  const ok = await crypto.subtle.verify('HMAC', hmac, sig, sigInput);
-  if (!ok) throw new Error('signature mismatch');
-  let plain;
-  try {
-    plain = await crypto.subtle.decrypt({ name: 'AES-GCM', iv }, aes, ct);
-  } catch (_) { throw new Error('decrypt failed'); }
+  let plain = await verifyAndDecrypt(await cryptoKeys(), iv, ct, sigInput, sig);
+  if (!plain) {
+    plain = await verifyAndDecrypt(await legacyKeys(), iv, ct, sigInput, sig);
+    if (plain) _needsRekey = true;
+  }
+  if (!plain) throw new Error('signature mismatch');
   return JSON.parse(new TextDecoder().decode(plain));
 }
 
@@ -730,6 +768,7 @@ async function silentLoad() {
       const obj = await openEnvelope(raw).catch(() => null);
       if (obj && obj.version === 1 && Array.isArray(obj.conversations)) {
         localState = obj;
+        if (_needsRekey) { _needsRekey = false; try { await persistState(); } catch (_) {} }
         return;
       }
     } catch (_) {}
