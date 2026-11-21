@@ -413,6 +413,14 @@ function updateBootProgress(text) {
 function hideBootProgress() {
   const box = $('boot-progress');
   if (box) box.classList.add('hidden');
+  // 终端内同款进度条也要一并隐藏，否则初始化已就绪后 #term-progress 仍卡在
+  // 「正在准备运行环境」；解压满 100% 之外的路径（已安装、无进度事件）只走到这里
+  const tBox = document.getElementById('term-progress');
+  if (tBox) {
+    tBox.classList.add('hidden');
+    const tFill = document.getElementById('term-progress-fill');
+    if (tFill) tFill.style.width = '0%';
+  }
 }
 
 async function ensureSandbox() {
@@ -970,6 +978,9 @@ class ModelPicker {
   constructor(root, onPick) {
     this.root = root;
     this.onPick = onPick;
+    // 侧边栏内的选择器：打开面板时不能再关抽屉，否则抽屉 transform 收起会把
+    // 作为其子节点、fixed 定位的面板一并带离视口，表现为「点开菜单立刻收回」
+    this.inSidebar = root.id === 'model-picker-side';
     this.view = 'main';                 // main | more | think | length
     this.root.classList.add('model-picker');
     this.root.innerHTML = `
@@ -1076,7 +1087,7 @@ class ModelPicker {
   }
   toggle() { this.panel.classList.contains('hidden') ? this.open() : this.close(); }
   open() {
-    closeSidebar();
+    if (!this.inSidebar) closeSidebar();
     document.querySelectorAll('.model-picker .mp-panel').forEach(p => { if (p !== this.panel) p.classList.add('hidden'); });
     this.view = 'main';
     this.render();
