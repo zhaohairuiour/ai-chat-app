@@ -2611,6 +2611,17 @@ select, option { background-color: #1c1c20 !important; color: #ececef !important
 .ui-confirm-btn.ok { background: #4d6bfe; border-color: #4d6bfe; color: #fff; }
 .ui-confirm-btn:active { opacity: .85; }
 
+/* ==================== 版本更新 ==================== */
+.update-card .update-title { font-size: 15px; font-weight: 600; color: #ececef; margin-bottom: 6px; }
+.update-card .update-ver { font-size: 12px; color: #8b949e; margin-bottom: 10px; }
+.update-card .update-notes {
+  font-size: 13px; color: #c9c9d1; line-height: 1.6; white-space: pre-wrap;
+  word-break: break-word; margin-bottom: 14px; max-height: 180px; overflow-y: auto;
+}
+.update-progress { height: 8px; border-radius: 6px; background: #232329; overflow: hidden; margin-bottom: 6px; }
+.update-progress-fill { height: 100%; width: 0%; background: #4d6bfe; border-radius: 6px; transition: width .2s ease; }
+.update-status { font-size: 12px; color: #8b949e; margin-bottom: 12px; min-height: 16px; }
+
 /* ==================== v3.32.46 · 自动执行块 ==================== */
 .code-autobash { border-color: rgba(46,160,67,.45); }
 .auto-exec-result {

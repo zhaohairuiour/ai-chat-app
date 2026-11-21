@@ -2549,6 +2549,18 @@ let attachments = []; // { type:'image'|'video'|'file'|'audio', name, data, form
 function escapeHtml(s) {
   return String(s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 }
+// 残留 ANSI/控制序列兜底剥离：原生 CSI 状态机漏掉的裸片段（ESC 丢失后的 "[90m" 等）不再落到终端
+function stripTermAnsi(s) {
+  return String(s == null ? '' : s)
+    .replace(/\x1b\[[0-9;?]*[ -/]*[@-~]/g, '')
+    .replace(/\x1b\][^\x07\n]*\x07/g, '')
+    .replace(/\[\d+(?:;\d+)*m/g, '')
+    .replace(/\[?\??2004[hl]/g, '')
+    .replace(/\[\?\d*[hl]/g, '')
+    .replace(/\[[0-9;]*[JKH]/g, '')
+    .replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f]/g, '')
+    .replace(/\r/g, '');
+}
 // ============ 附件：按文件类型显示彩色图标 / 照片缩略图 ============
 function fileExtOf(name) {
   const m = String(name || '').match(/\.([a-z0-9]+)(?:\.tar)?$/i);
@@ -4554,12 +4566,14 @@ async function initFloatingTerminal() {
         for (let i = 0; i < runs.length; i++) {
           const r = runs[i];
           const span = document.createElement('span');
+          let text;
           if (typeof r === 'string') {
-            span.textContent = r;
+            text = stripTermAnsi(r);
           } else if (r) {
             if (typeof r.c === 'number' && r.c >= 0) span.className = 'tc-' + r.c;
-            span.textContent = r.t || '';
-          }
+            text = stripTermAnsi(r.t || '');
+          } else { text = ''; }
+          span.textContent = text;
           if (span.textContent) container.appendChild(span);
         }
       },
@@ -5422,6 +5436,159 @@ async function initFloatingTerminal() {
     }
   });
 }
+// ==================== 版本更新：镜像源拉取清单 → 版本比对 → 下载安装 ====================
+const UPDATE_REPO = 'zhaohairuiour/ai-chat-app';
+const UPDATE_BRANCH = 'main';
+// 清单 JSON 经镜像前缀回源，顺序即优先级；末尾直连兜底
+const MANIFEST_MIRRORS = [
+  'https://ghproxy.net/https://raw.githubusercontent.com/' + UPDATE_REPO + '/' + UPDATE_BRANCH + '/version.json',
+  'https://gh-proxy.com/https://raw.githubusercontent.com/' + UPDATE_REPO + '/' + UPDATE_BRANCH + '/version.json',
+  'https://mirror.ghproxy.com/https://raw.githubusercontent.com/' + UPDATE_REPO + '/' + UPDATE_BRANCH + '/version.json',
+  'https://raw.githubusercontent.com/' + UPDATE_REPO + '/' + UPDATE_BRANCH + '/version.json'
+];
+// APK 下载镜像前缀（拼在 Release 下载地址前），空串为直连兜底
+const APK_MIRROR_PREFIXES = ['https://ghproxy.net/', 'https://gh-proxy.com/', 'https://mirror.ghproxy.com/', ''];
+
+function compareVer(a, b) {
+  const pa = String(a || '').split('.').map(x => parseInt(x, 10) || 0);
+  const pb = String(b || '').split('.').map(x => parseInt(x, 10) || 0);
+  for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
+    const d = (pa[i] || 0) - (pb[i] || 0);
+    if (d) return d;
+  }
+  return 0;
+}
+
+async function fetchTextTimeout(url, ms = 12000) {
+  const ctl = new AbortController();
+  const timer = setTimeout(() => ctl.abort(), ms);
+  try {
+    const r = await fetch(url, { signal: ctl.signal, cache: 'no-store', headers: { 'Cache-Control': 'no-cache' } });
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    return await r.text();
+  } finally { clearTimeout(timer); }
+}
+
+async function fetchUpdateManifest() {
+  let lastErr = null;
+  for (const url of MANIFEST_MIRRORS) {
+    try {
+      const txt = await fetchTextTimeout(url, 12000);
+      const j = JSON.parse(txt);
+      if (j && j.apkUrl) return j;
+    } catch (e) { lastErr = e; }
+  }
+  throw lastErr || new Error('更新清单拉取失败');
+}
+
+let _updateDlg = null;
+
+function showUpdateDialog(manifest, cur) {
+  if (_updateDlg) return;
+  const mask = document.createElement('div');
+  mask.className = 'ui-confirm-mask';
+  mask.innerHTML = `
+    <div class="ui-confirm-card update-card">
+      <div class="update-title">发现新版本 ${escapeHtml(manifest.versionName || '')}</div>
+      <div class="update-ver">当前 ${escapeHtml(cur.name || '?')} → 最新 ${escapeHtml(manifest.versionName || '')}</div>
+      <div class="update-notes">${escapeHtml(manifest.notes || '暂无更新说明')}</div>
+      <div class="update-progress hidden"><div class="update-progress-fill"></div></div>
+      <div class="update-status hidden"></div>
+      <div class="ui-confirm-actions">
+        <button type="button" class="ui-confirm-btn cancel">稍后</button>
+        <button type="button" class="ui-confirm-btn ok">立即更新</button>
+      </div>
+    </div>`;
+  document.body.appendChild(mask);
+  const state = { mask, manifest, busy: false };
+  _updateDlg = state;
+  const okBtn = mask.querySelector('.ok');
+  const cancelBtn = mask.querySelector('.cancel');
+  const bar = mask.querySelector('.update-progress');
+  const fill = mask.querySelector('.update-progress-fill');
+  const status = mask.querySelector('.update-status');
+  const close = () => { mask.remove(); if (_updateDlg === state) _updateDlg = null; };
+  const dismissTag = String(manifest.versionCode || manifest.versionName);
+  cancelBtn.onclick = () => {
+    try { localStorage.setItem('aichat-update-dismissed', dismissTag); } catch (_) {}
+    close();
+  };
+  mask.onclick = (e) => { if (e.target === mask && !state.busy) close(); };
+  okBtn.onclick = () => startUpdate(state, { bar, fill, status, okBtn, cancelBtn, close });
+}
+
+async function downloadUpdateApk(manifest, sb) {
+  if (!sb || typeof sb.downloadApk !== 'function') throw new Error('下载能力不可用');
+  let lastErr = null;
+  for (const p of APK_MIRROR_PREFIXES) {
+    const url = p + manifest.apkUrl;
+    try { return await sb.downloadApk({ url }); }
+    catch (e) { lastErr = e; }
+  }
+  throw lastErr || new Error('所有镜像均下载失败');
+}
+
+async function startUpdate(state, ui) {
+  const { manifest } = state;
+  state.busy = true;
+  ui.okBtn.disabled = true;
+  ui.cancelBtn.disabled = true;
+  ui.bar.classList.remove('hidden');
+  ui.status.classList.remove('hidden');
+  const setPct = (pct, label) => {
+    if (pct >= 0) ui.fill.style.width = pct + '%';
+    if (label != null) ui.status.textContent = label;
+  };
+  const sb = getSandbox();
+  if (sb && typeof sb.addListener === 'function') {
+    try {
+      sb.addListener('update-progress', (ev) => {
+        if (ev && typeof ev.pct === 'number') setPct(ev.pct, ev.pct >= 0 ? '下载中 ' + ev.pct + '%' : '下载中…');
+      });
+    } catch (_) {}
+  }
+  try {
+    setPct(0, '准备下载…');
+    const r = await downloadUpdateApk(manifest, sb);
+    setPct(100, '下载完成，正在拉起安装…');
+    if (sb && typeof sb.installApk === 'function') await sb.installApk({ path: r.path });
+    else throw new Error('当前版本不支持应用内安装');
+  } catch (e) {
+    state.busy = false;
+    ui.okBtn.disabled = false;
+    ui.cancelBtn.disabled = false;
+    ui.status.textContent = '更新失败：' + (e && e.message ? e.message : e);
+    toast('更新失败，请稍后重试', 'error', 4000);
+  }
+}
+
+async function checkAppUpdate(silent) {
+  if (!IS_NATIVE) return;
+  let manifest;
+  try { manifest = await fetchUpdateManifest(); }
+  catch (e) { if (!silent) toast('更新检查失败：' + (e && e.message || e), 'error', 3000); return; }
+  if (!manifest || !manifest.apkUrl) return;
+  let curCode = 0, curName = window.__APP_VER || '0.0.0';
+  const sb = getSandbox();
+  try {
+    if (sb && typeof sb.appInfo === 'function') {
+      const info = await sb.appInfo();
+      if (info) { curCode = Number(info.versionCode) || 0; curName = info.versionName || curName; }
+    }
+  } catch (_) {}
+  const newCode = Number(manifest.versionCode) || 0;
+  const newer = curCode > 0 && newCode > 0 ? newCode > curCode : compareVer(manifest.versionName, curName) > 0;
+  if (!newer) { if (!silent) toast('已是最新版本', 'info', 2000); return; }
+  const tag = String(manifest.versionCode || manifest.versionName);
+  let dismissed = '';
+  try { dismissed = localStorage.getItem('aichat-update-dismissed') || ''; } catch (_) {}
+  if (silent && dismissed === tag) return;
+  showUpdateDialog(manifest, { name: curName, code: curCode });
+}
+
+const btnCheckUpdate = $('btn-check-update');
+if (btnCheckUpdate) btnCheckUpdate.onclick = () => checkAppUpdate(false);
+
 initFloatingTerminal();
 
 // 关闭/刷新页面且仍有命令在执行时提示（WebView 内不弹窗，浏览器端生效）
@@ -5429,3 +5596,6 @@ window.addEventListener('beforeunload', () => {
   // 关闭终端 / 切后台不终止任务：命令继续由原生进程执行，回到页面时结果仍在
   window.__termAnyBusy = false;
 });
+
+// 启动后延迟静默检查更新；失败/无新版本均不打扰
+setTimeout(() => { checkAppUpdate(true); }, 2500);

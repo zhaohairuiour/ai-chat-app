@@ -699,6 +699,14 @@ public class SandboxPlugin extends Plugin {
                 execCmd = execCmd.replaceAll("pkg upgrade ", "pkg upgrade -y ");
                 }
 
+                // openclaw 等带 TUI/颜色的 CLI 在 xterm-256color 下会输出 SGR 颜色与光标/备用屏
+                // 控制序列；本桥接是行级模型，解释不了光标定位，序列漏网后被逐字拆成竖排乱码。
+                // 这类命令强制纯文本：注入 dumb 终端、关闭颜色与交互提示，并给 CLI 加 --no-color。
+                final boolean tuiCli = cmd.matches("(?is).*\\bopenclaw\\b.*") || cmd.contains("openclaw.mjs");
+                if (tuiCli) {
+                    execCmd = execCmd.replaceAll("(?is)^(\\s*openclaw)(\\s+)", "$1 --no-color$2");
+                }
+
                 // 手动命令走 pty：apt 在 stdin 非 tty 时会直接 "Abort." 而不等用户回答，
                 // script 用 util-linux 的伪终端包一层后，y/n 才能真正在输入框里作答
                 if (interactive && new File(prefix, "bin/script").exists()) {
@@ -740,6 +748,15 @@ public class SandboxPlugin extends Plugin {
                 pb.environment().put("TERMINFO_DIRS",
                     prefixPath + "/share/terminfo:/system/usr/share/terminfo");
                 pb.environment().put("LANG", "en_US.UTF-8");
+                if (tuiCli) {
+                    // 行级桥接无法承载 TUI：dumb 终端让 CLI 退化为纯文本流，颜色/交互一并关闭
+                    pb.environment().put("TERM", "dumb");
+                    pb.environment().put("NO_COLOR", "1");
+                    pb.environment().put("FORCE_COLOR", "0");
+                    pb.environment().put("CLICOLOR", "0");
+                    pb.environment().put("CI", "1");
+                    pb.environment().remove("COLORTERM");
+                }
                 // 覆盖 apt/dpkg 硬编码的 com.termux 路径
                 pb.environment().put("APT_CONFIG", prefixPath + "/etc/apt/apt.conf.d/00-prefix-override");
                 pb.environment().put("DPKG_ADMINDIR", prefixPath + "/var/lib/dpkg");
@@ -1335,10 +1352,22 @@ public class SandboxPlugin extends Plugin {
     }
 
     /** 把 TermBuf 拆成同色片段，前端按片段生成 span，颜色完全来自程序自身的 SGR */
+    /** CSI 状态机漏掉的裸转义片段兜底剥离：ESC 丢失后残留的 "[90m"、"[?2004h" 等不再落到前端 */
+    private static String stripResidualAnsi(String s) {
+        if (s == null) return "";
+        return s.replaceAll("\u001B\\[[0-9;?]*[ -/]*[@-~]", "")
+            .replaceAll("\u001B\\][^\u0007\n]*\u0007", "")
+            .replaceAll("\\[\\d+(?:;\\d+)*m", "")
+            .replaceAll("\\[?\\??2004[hl]", "")
+            .replaceAll("\\[\\?\\d*[hl]", "")
+            .replaceAll("\\[[0-9;]*[JKH]", "")
+            .replaceAll("[\u0000-\u0008\u000b\u000c\u000e-\u001f]", "");
+    }
+
     private void emitBuffer(String stream, TermBuf tb, boolean fin) {
         if (tb == null) return;
         int len = tb.text.length();
-        String plain = tb.text.toString().trim();
+        String plain = stripResidualAnsi(tb.text.toString()).trim();
         if (!fin && plain.isEmpty()) return;
         try {
             com.getcapacitor.JSArray runs = new com.getcapacitor.JSArray();
@@ -1347,7 +1376,8 @@ public class SandboxPlugin extends Plugin {
                 int c = tb.colorAt(i);
                 int j = i + 1;
                 while (j < len && tb.colorAt(j) == c) j++;
-                String seg = tb.text.substring(i, j);
+                String seg = stripResidualAnsi(tb.text.substring(i, j));
+                if (seg.isEmpty()) { i = j; continue; }
                 if (c >= 0 && c <= 7) {
                     JSObject run = new JSObject();
                     run.put("t", seg);
@@ -1385,71 +1415,104 @@ public class SandboxPlugin extends Plugin {
         }
     }
 
+    /** 末尾不完整 UTF-8 序列的字节数：多字节字符若被读边界拆开，留到下一块再解码，避免半个字变替换符 */
+    private static int trailingIncompleteUtf8(byte[] b, int len) {
+        int i = len - 1, cont = 0;
+        while (i >= 0 && (b[i] & 0xC0) == 0x80) { cont++; i--; }
+        if (i < 0) return 0;
+        int lead = b[i] & 0xFF;
+        int need;
+        if ((lead & 0x80) == 0) need = 1;
+        else if ((lead & 0xE0) == 0xC0) need = 2;
+        else if ((lead & 0xF0) == 0xE0) need = 3;
+        else if ((lead & 0xF8) == 0xF0) need = 4;
+        else need = 1;
+        int missing = need - cont - 1;
+        return Math.max(0, missing);
+    }
+
+    /** 把一段已按完整字符边界解码的文本喂入行模型；state 用 int[] 以便跨块保留 CSI/OSC 状态 */
+    private void feedTermSeg(TermBuf tb, StringBuilder csi, int[] state, String seg, String stream, StringBuilder buf) {
+        for (int i = 0; i < seg.length(); i++) {
+            char c = seg.charAt(i);
+            if (state[0] == 0) {
+                if (c == '\u001b') { state[0] = 1; continue; }
+                if (c == '\n') {
+                    // 换行：这一行已经是最终内容
+                    if (buf.length() < 500000) buf.append(tb.text).append('\n');
+                    emitBuffer(stream, tb, true);
+                    tb.reset();
+                } else if (c == '\r') {
+                    // 回车：把当前已显示内容推给前端（下一段会原地覆盖）
+                    if (buf.length() < 500000) buf.append(tb.text).append('\n');
+                    emitBuffer(stream, tb, false);
+                    tb.carriageReturn();
+                } else if (c == '\b') {
+                    tb.backspace();
+                } else if (c == '\t') {
+                    int next = ((tb.col / 8) + 1) * 8;
+                    while (tb.col < next) tb.put(' ');
+                } else if (c < 0x20 || c == 0x7f) {
+                    // 其余 C0（含 \u0001 \u0002 \u0007）丢弃
+                } else {
+                    tb.put(c);
+                }
+            } else if (state[0] == 1) {
+                if (c == '[') { state[0] = 2; csi.setLength(0); }
+                else if (c == ']') { state[0] = 3; }
+                else state[0] = 0;
+            } else if (state[0] == 2) {
+                if (c >= 0x40 && c <= 0x7e) {
+                    String ps = csi.toString();
+                    if (c == 'K') {
+                        String mode = ps.replace("?", "");
+                        if ("2".equals(mode)) tb.eraseAll();
+                        else if ("0".equals(mode) || mode.isEmpty()) tb.eraseToEnd();
+                        emitBuffer(stream, tb, false);
+                    } else if (c == 'J') {
+                        if ("2".equals(ps.replace("?", "")) || "3".equals(ps.replace("?", ""))) {
+                            tb.eraseAll();
+                            emitBuffer(stream, tb, false);
+                        }
+                    } else if (c == 'm') {
+                        applySgr(tb, ps);
+                    }
+                    // H/A/B/C/D 等光标定位在行模型下无意义，直接忽略
+                    state[0] = 0;
+                } else {
+                    csi.append(c);
+                }
+            } else if (state[0] == 3) {
+                if (c == '\u0007') state[0] = 0;
+            }
+        }
+    }
+
     private Thread streamReader(final InputStream is, final String stream, final StringBuilder buf) {
         Thread th = new Thread(() -> {
             final byte[] chunk = new byte[4096];
             final TermBuf tb = new TermBuf();
             final StringBuilder csi = new StringBuilder();
-            int state = 0; // 0=普通 1=ESC 2=CSI 3=OSC
+            final int[] state = {0}; // 0=普通 1=ESC 2=CSI 3=OSC
+            final java.io.ByteArrayOutputStream pending = new java.io.ByteArrayOutputStream();
             int n;
             try {
                 while ((n = is.read(chunk)) != -1) {
-                    String seg = new String(chunk, 0, n, StandardCharsets.UTF_8);
-                    for (int i = 0; i < seg.length(); i++) {
-                        char c = seg.charAt(i);
-                        if (state == 0) {
-                            if (c == '\u001b') { state = 1; continue; }
-                            if (c == '\n') {
-                                // 换行：这一行已经是最终内容
-                                if (buf.length() < 500000) buf.append(tb.text).append('\n');
-                                emitBuffer(stream, tb, true);
-                                tb.reset();
-                            } else if (c == '\r') {
-                                // 回车：把当前已显示内容推给前端（下一段会原地覆盖）
-                                if (buf.length() < 500000) buf.append(tb.text).append('\n');
-                                emitBuffer(stream, tb, false);
-                                tb.carriageReturn();
-                            } else if (c == '\b') {
-                                tb.backspace();
-                            } else if (c == '\t') {
-                                int next = ((tb.col / 8) + 1) * 8;
-                                while (tb.col < next) tb.put(' ');
-                            } else if (c < 0x20 || c == 0x7f) {
-                                // 其余 C0（含 \u0001 \u0002 \u0007）丢弃
-                            } else {
-                                tb.put(c);
-                            }
-                        } else if (state == 1) {
-                            if (c == '[') { state = 2; csi.setLength(0); }
-                            else if (c == ']') { state = 3; }
-                            else state = 0;
-                        } else if (state == 2) {
-                            if (c >= 0x40 && c <= 0x7e) {
-                                String ps = csi.toString();
-                                if (c == 'K') {
-                                    String mode = ps.replace("?", "");
-                                    if ("2".equals(mode)) tb.eraseAll();
-                                    else if ("0".equals(mode) || mode.isEmpty()) tb.eraseToEnd();
-                                    emitBuffer(stream, tb, false);
-                                } else if (c == 'J') {
-                                    if ("2".equals(ps.replace("?", "")) || "3".equals(ps.replace("?", ""))) {
-                                        tb.eraseAll();
-                                        emitBuffer(stream, tb, false);
-                                    }
-                                } else if (c == 'm') {
-                                    applySgr(tb, ps);
-                                }
-                                // H/A/B/C/D 等光标定位在行模型下无意义，直接忽略
-                                state = 0;
-                            } else {
-                                csi.append(c);
-                            }
-                        } else if (state == 3) {
-                            if (c == '\u0007') state = 0;
-                        }
-                    }
+                    pending.write(chunk, 0, n);
+                    byte[] all = pending.toByteArray();
+                    int tail = trailingIncompleteUtf8(all, all.length);
+                    int decLen = all.length - tail;
+                    String seg = new String(all, 0, decLen, StandardCharsets.UTF_8);
+                    pending.reset();
+                    if (tail > 0) pending.write(all, decLen, tail);
+                    feedTermSeg(tb, csi, state, seg, stream, buf);
                     // 进程阻塞等输入（读缓冲空）：把提示符作为活动行推出去
                     if (tb.col > 0 && is.available() == 0) emitBuffer(stream, tb, false);
+                }
+                // EOF：把残留的不完整序列按兜底解码吐出，避免末尾半个字丢失
+                if (pending.size() > 0) {
+                    String seg = new String(pending.toByteArray(), StandardCharsets.UTF_8);
+                    feedTermSeg(tb, csi, state, seg, stream, buf);
                 }
                 if (!tb.isEmpty()) {
                     if (buf.length() < 500000) buf.append(tb.text).append('\n');
@@ -2509,6 +2572,103 @@ public class SandboxPlugin extends Plugin {
     private static void writeText(File f, String text) throws Exception {
         try (FileOutputStream out = new FileOutputStream(f)) {
             out.write(text.getBytes(StandardCharsets.UTF_8));
+        }
+    }
+
+    // ======================= 应用内版本更新 =======================
+
+    /** 返回当前安装包的 versionName / versionCode，供前端与远端清单做数值比对 */
+    @PluginMethod
+    public void appInfo(PluginCall call) {
+        try {
+            android.content.pm.PackageInfo pi = getContext().getPackageManager()
+                    .getPackageInfo(getContext().getPackageName(), 0);
+            JSObject ret = new JSObject();
+            ret.put("versionName", pi.versionName == null ? "" : pi.versionName);
+            ret.put("versionCode", pi.versionCode);
+            call.resolve(ret);
+        } catch (Throwable e) {
+            call.reject("读取版本信息失败: " + e.getMessage());
+        }
+    }
+
+    /**
+     * 下载更新包到应用缓存目录。进度通过 "update-progress" 事件推送（pct/done/total）。
+     * 调用方负责按镜像源顺序重试不同 URL；本方法只负责单次下载。
+     */
+    @PluginMethod
+    public void downloadApk(final PluginCall call) {
+        final String url = call.getString("url", "");
+        if (url.isEmpty()) { call.reject("url 为空"); return; }
+        new Thread(() -> {
+            File dir = new File(getContext().getCacheDir(), "update");
+            if (!dir.exists()) dir.mkdirs();
+            File out = new File(dir, "app-update.apk");
+            java.net.HttpURLConnection conn = null;
+            try {
+                conn = (java.net.HttpURLConnection) new java.net.URL(url).openConnection();
+                conn.setConnectTimeout(15000);
+                conn.setReadTimeout(30000);
+                conn.setInstanceFollowRedirects(true);
+                conn.setRequestProperty("User-Agent", "Mozilla/5.0 (Android) AIChat-Updater");
+                int code = conn.getResponseCode();
+                if (code < 200 || code >= 300) {
+                    call.reject("下载失败 HTTP " + code);
+                    return;
+                }
+                long total = conn.getContentLength();
+                long done = 0;
+                int lastPct = -1;
+                try (InputStream in = conn.getInputStream();
+                     FileOutputStream fos = new FileOutputStream(out)) {
+                    byte[] buf = new byte[32768];
+                    int n;
+                    while ((n = in.read(buf)) > 0) {
+                        fos.write(buf, 0, n);
+                        done += n;
+                        int pct = total > 0 ? (int) (done * 100 / total) : -1;
+                        if (pct != lastPct) {
+                            lastPct = pct;
+                            JSObject ev = new JSObject();
+                            ev.put("pct", pct);
+                            ev.put("done", done);
+                            ev.put("total", total);
+                            notifyListeners("update-progress", ev);
+                        }
+                    }
+                }
+                if (out.length() <= 0) { call.reject("安装包为空"); return; }
+                JSObject ret = new JSObject();
+                ret.put("path", out.getAbsolutePath());
+                ret.put("size", out.length());
+                call.resolve(ret);
+            } catch (Throwable e) {
+                call.reject("下载失败: " + e.getMessage());
+            } finally {
+                if (conn != null) conn.disconnect();
+            }
+        }, "aichat-apk-download").start();
+    }
+
+    /** 拉起系统安装器安装本地 APK；通过 FileProvider 授权读取 */
+    @PluginMethod
+    public void installApk(PluginCall call) {
+        String path = call.getString("path", "");
+        if (path.isEmpty()) { call.reject("path 为空"); return; }
+        File f = new File(path);
+        if (!f.exists()) { call.reject("安装包不存在: " + path); return; }
+        try {
+            android.net.Uri uri = androidx.core.content.FileProvider.getUriForFile(
+                    getContext(), getContext().getPackageName() + ".fileprovider", f);
+            android.content.Intent i = new android.content.Intent(android.content.Intent.ACTION_VIEW);
+            i.setDataAndType(uri, "application/vnd.android.package-archive");
+            i.addFlags(android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION);
+            i.addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK);
+            i.addFlags(android.content.Intent.FLAG_ACTIVITY_CLEAR_TOP);
+            getContext().startActivity(i);
+            call.resolve();
+        } catch (Throwable e) {
+            call.reject("拉起安装失败: " + e.getMessage());
         }
     }
 }
