@@ -5443,11 +5443,10 @@ const UPDATE_BRANCH = 'main';
 const MANIFEST_MIRRORS = [
   'https://ghproxy.net/https://raw.githubusercontent.com/' + UPDATE_REPO + '/' + UPDATE_BRANCH + '/version.json',
   'https://gh-proxy.com/https://raw.githubusercontent.com/' + UPDATE_REPO + '/' + UPDATE_BRANCH + '/version.json',
-  'https://mirror.ghproxy.com/https://raw.githubusercontent.com/' + UPDATE_REPO + '/' + UPDATE_BRANCH + '/version.json',
   'https://raw.githubusercontent.com/' + UPDATE_REPO + '/' + UPDATE_BRANCH + '/version.json'
 ];
 // APK 下载镜像前缀（拼在 Release 下载地址前），空串为直连兜底
-const APK_MIRROR_PREFIXES = ['https://ghproxy.net/', 'https://gh-proxy.com/', 'https://mirror.ghproxy.com/', ''];
+const APK_MIRROR_PREFIXES = ['https://ghproxy.net/', 'https://gh-proxy.com/', ''];
 
 function compareVer(a, b) {
   const pa = String(a || '').split('.').map(x => parseInt(x, 10) || 0);
