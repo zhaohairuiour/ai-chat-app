@@ -1,8 +1,8 @@
 {
-  "versionName": "3.32.101",
-  "versionCode": 455,
-  "apkUrl": "https://github.com/zhaohairuiour/ai-chat-app/releases/download/v3.32.101/ai-chat-app-v3.32.101-nokeys.apk",
-  "notes": "修复 openclaw 终端输出乱码（强制纯文本/关闭颜色，补齐 UTF-8 分块边界与残留序列剥离）；新增经镜像源拉取清单的版本自动更新。",
+  "versionName": "3.32.102",
+  "versionCode": 456,
+  "apkUrl": "https://github.com/zhaohairuiour/ai-chat-app/releases/download/v3.32.102/ai-chat-app-v3.32.102-nokeys.apk",
+  "notes": "修复自动执行失效、重试重复写入、串流切会话错写、停止被 fallback 吞掉、终端标签关闭异常、字号设置无效、启动覆盖备份等 13 项缺陷。",
   "force": false,
-  "publishedAt": "2026-11-21"
+  "publishedAt": "2026-11-22"
 }

@@ -1397,22 +1397,23 @@ async function api(path, opts = {}) {
 
 // ========== 登录/注册 ==========
 let authMode = 'login';
-let codeCountdown = null; // 发送验证码倒计时定时器
 function startCodeCountdown(btn, seconds) {
   const orig = btn.dataset.origText || btn.textContent;
   if (!btn.dataset.origText) btn.dataset.origText = orig;
   btn.disabled = true;
-  let left = seconds;
-  btn.textContent = left + 's';
-  clearInterval(codeCountdown);
-  codeCountdown = setInterval(() => {
-    left -= 1;
-    if (left <= 0) {
-      clearInterval(codeCountdown);
+  // 每个按钮独立计时：在注册与邮箱登录之间切换时，互不打断
+  if (btn._codeTimer) clearInterval(btn._codeTimer);
+  btn._codeLeft = seconds;
+  btn.textContent = btn._codeLeft + 's';
+  btn._codeTimer = setInterval(() => {
+    btn._codeLeft -= 1;
+    if (btn._codeLeft <= 0) {
+      clearInterval(btn._codeTimer);
+      btn._codeTimer = null;
       btn.disabled = false;
       btn.textContent = btn.dataset.origText;
     } else {
-      btn.textContent = left + 's';
+      btn.textContent = btn._codeLeft + 's';
     }
   }, 1000);
 }
@@ -1431,7 +1432,8 @@ async function sendMailCode(btn, emailInput, purpose) {
     if (r.dev) {
       // 后端未配置 SMTP：直接回填验证码，避免用户拿不到码以为发送失败
       if (r.code) {
-        const codeInput = document.getElementById('auth-code');
+        // 注册验证码在 #auth-code，邮箱验证码登录在 #mail-login-code，不能混填
+        const codeInput = document.getElementById(purpose === 'register' ? 'auth-code' : 'mail-login-code');
         if (codeInput) codeInput.value = String(r.code);
         toast('验证码已填入（当前环境未配置邮件服务）', 'info');
       } else {
@@ -1603,8 +1605,15 @@ async function afterLogin(user) {
   $('btn-logout').classList.toggle('hidden', isGuest || isLocal);
   $('btn-bind-email').innerHTML = svgIcon(user.email ? 'edit' : 'link', 12) + ' ' + (user.email ? '修改邮箱' : '绑定邮箱');
   await loadModels();
-  // 从本地存储恢复对话历史（三份备份校验）
-  try { if (window.localCore) await window.localCore.verifyAndRestore(); } catch (_) {}
+  // 从本地存储恢复对话历史（三份备份校验）；校验失败要明确告知，不能静默清空
+  try {
+    if (window.localCore) {
+      const vr = await window.localCore.verifyAndRestore();
+      if (vr && vr.ok === false) {
+        toast('本地备份校验失败，已按安全策略重置本地数据', 'error', 5000);
+      }
+    }
+  } catch (_) {}
   await loadConversations();
   await loadNodes();
   renderSkills();
@@ -2124,6 +2133,7 @@ function openHtmlPreview(codeText, filename, files) {
   const close = () => {
     ov.classList.remove('show');
     document.body.style.overflow = '';
+    document.removeEventListener('keydown', ov._esc);
     setTimeout(() => { ov.remove(); if (ov._blobUrl) URL.revokeObjectURL(ov._blobUrl); }, 200);
   };
   ov.addEventListener('click', (e) => {
@@ -2477,10 +2487,9 @@ function finalizeAIMessage(wrap, bubble) {
   });
   body.appendChild(bar);
 
-  // 自动执行：渲染阶段已把 /--auto-bash--/ 块转成 .code-autobash，这里按块逐个执行
-  if (IS_NATIVE && autoExec && !bubble.dataset.markerExecDone) {
-    const textEl = bubble.querySelector('.msg-text');
-    const blocks = textEl ? Array.from(textEl.querySelectorAll('.code-autobash')) : [];
+  // 自动执行：仅本次新回复生效（历史对话重放不执行），且必须等沙箱真正就绪
+  if (IS_NATIVE && autoExec && bubble.dataset.autoExec === '1' && !bubble.dataset.markerExecDone) {
+    const blocks = Array.from(bubble.querySelectorAll('.code-autobash'));
     if (blocks.length) {
       bubble.dataset.markerExecDone = '1';
       blocks.forEach((block) => {
@@ -2497,17 +2506,19 @@ function finalizeAIMessage(wrap, bubble) {
 
         (async () => {
           try {
-            const sb = await getSandbox();
+            // 统一走 ensureSandbox：注册 output 监听、初始化并应用运行配置；避免每个块重复 sb.init()
+            const sb = await ensureSandbox();
             if (!sb) { resultEl.innerHTML = '<span class="ae-err">沙箱不可用</span>'; return; }
-            await sb.init();
             const killBtn = resultEl.querySelector('.kill-cmd-btn');
             if (killBtn) killBtn.onclick = () => {
-              sb.kill && sb.kill();
+              if (sb.kill) sb.kill();
               resultEl.innerHTML = '<span class="ae-err">▶ 已手动停止</span>';
             };
             const r = await sb.exec({ cmd, timeout: 300000 });
             const out = ((r.stdout || '') + (r.stderr || '')).trim();
-            resultEl.innerHTML = '<span class="ae-ok">▶ 执行完成</span>'
+            const code = (r && r.code != null) ? r.code : 0;
+            resultEl.innerHTML = '<span class="' + (code === 0 ? 'ae-ok' : 'ae-err') + '">'
+              + (code === 0 ? '▶ 执行完成' : '▶ 执行失败（退出码 ' + escapeHtml(String(code)) + '）') + '</span>'
               + '<pre class="ae-out">' + escapeHtml(out.slice(0, 3000) || '（无输出）') + '</pre>';
           } catch (e) {
             resultEl.innerHTML = '<span class="ae-err">▶ 执行失败：' + escapeHtml(e.message || '') + '</span>';
@@ -2979,7 +2990,7 @@ function addProjectStepLine(bubble, html) {
   el.appendChild(d);
   return d;
 }
-function renderProjectCard(bubble, files) {
+function renderProjectCard(bubble, files, convIdArg) {
   const sorted = [...files].sort((a, b) => a.path.localeCompare(b.path));  const card = document.createElement('div');
   card.className = 'project-card';
   card.innerHTML = `
@@ -3003,8 +3014,7 @@ function renderProjectCard(bubble, files) {
         </div>`;
       }).join('')}
     </div>`;
-  const convId = currentConvId;
-  card.querySelector('.project-zip-btn').onclick = () => downloadProjectZip('project', sorted);
+  const convId = convIdArg || currentConvId;  card.querySelector('.project-zip-btn').onclick = () => downloadProjectZip('project', sorted);
   card.querySelector('.project-ver-btn').onclick = () => openProjectVersions(card, convId);
   card.querySelectorAll('.project-file-copy').forEach(b => {
     b.onclick = () => {
@@ -3477,9 +3487,12 @@ async function sendMessage() {
     bubble.parentNode.appendChild(logWrap);
     window.__agentLogBox = logWrap.querySelector('.agent-log-box');
     try {
-      const conv = ensureConversation(currentConvId, currentModel);
-      if (!currentConvId) { currentConvId = conv.id; }
-      appendConvMessage(currentConvId, { role: 'user', content: text });
+      // 锁定本次任务所属对话，避免用户在 Agent 运行期间切换会话写错地方
+      const convId = currentConvId || nextConvId();
+      if (!currentConvId) currentConvId = convId;
+      ensureConversation(convId, currentModel);
+      appendConvMessage(convId, { role: 'user', content: text });
+      try { bindLastUserEdit(); } catch (_) {}
       const r = await (window.__runAgentTask ? window.__runAgentTask(text, currentModel) : Promise.resolve(null));
       const out = (r && r.text) ? r.text : ('Agent 执行结束（退出码 ' + (r && r.code != null ? r.code : '?') + '）');
       window.__agentBubble = null;
@@ -3487,12 +3500,14 @@ async function sendMessage() {
       window.__agentLogBox = null;
       bubble.classList.remove('typing');
       bubble.textContent = out;
-      appendConvMessage(currentConvId, { role: 'assistant', content: out });
+      appendConvMessage(convId, { role: 'assistant', content: out });
       try { await persistState(); } catch (_) {}
       loadConversations();
       finalizeAIMessage(wrap, bubble);
     } catch (e) {
       window.__agentBubble = null;
+      window.__agentRunning = false;
+      window.__agentLogBox = null;
       bubble.classList.remove('typing');
       bubble.textContent = 'Agent 执行失败：' + (e && e.message ? e.message : e);
     }
@@ -3563,13 +3578,18 @@ async function doChat(text, isRetry = false, opts = {}) {
       : String(text == null ? '' : text);
   const isProject = opts.project === true;
   if (deactivating) { promptDeactivated(); return; }
+  // 先锁定本次请求所属的对话：串流期间用户切到其它对话时，结果仍写回原对话
+  const isNewConv = !currentConvId;
+  const convId = currentConvId || nextConvId();
+  if (!currentConvId) currentConvId = convId;
   streaming = true;
   btnSend.disabled = true;
   if (btnStop) btnStop.classList.remove('hidden');
   chatAbort = new AbortController();
   const chatSeq = (window.__chatSeq = (window.__chatSeq || 0) + 1);
   const { wrap: aiWrap, bubble: aiBubble } = addMessage('assistant', '');
-  aiBubble.classList.add('typing');
+  // 只允许“本次新回复”触发自动执行；历史消息重放绝不执行命令
+  aiBubble.dataset.autoExec = (!isProject && IS_NATIVE) ? '1' : '0';
   aiBubble.classList.add('typing');
   aiBubble.innerHTML = '<span class="typing-dots" aria-label="正在思考"><i></i><i></i><i></i></span>'
     + (opts.hasImage ? '<span class="typing-hint">正在上传 / 解析图片…</span>' : '');
@@ -3711,11 +3731,8 @@ async function doChat(text, isRetry = false, opts = {}) {
     if (!dataStr) return;
     let data; try { data = JSON.parse(dataStr); } catch { return; }
     if (event === 'start') {
-      if (!currentConvId && data.conversation_id) {
-        currentConvId = data.conversation_id;
-        $('chat-title').textContent = data.title;
-        loadConversations();
-      }
+      // 对话 ID 已在发送时锁定，不再依赖服务端回传
+      if (!isRetry && data.title) $('chat-title').textContent = data.title;
       // 绑定刚发送的用户消息 id，支持"点击即可修改"
       if (data.user_message_id) {
         const lastUser = [...document.querySelectorAll('#messages .msg.user')].pop();
@@ -3723,7 +3740,7 @@ async function doChat(text, isRetry = false, opts = {}) {
       }
     } else if (event === 'title') {
       if (data.title) {
-        if (!data.conversation_id || currentConvId === data.conversation_id) {
+        if (!data.conversation_id || convId === data.conversation_id) {
           $('chat-title').textContent = data.title;
         }
         loadConversations();
@@ -3813,13 +3830,13 @@ async function doChat(text, isRetry = false, opts = {}) {
         const el = aiBubble.querySelector('.project-progress');
         if (el) el.remove();
         if (data.files && data.files.length) {
-          renderProjectCard(aiBubble, data.files);
+          renderProjectCard(aiBubble, data.files, convId);
           // 保存到使用用户的设备（浏览器 IndexedDB），服务器不落盘
           try {
             const filesMap = {};
             data.files.forEach(f => { filesMap[f.path] = f.content; });
-            idbGetProject(currentConvId).then(rec =>
-              idbSaveProject(currentConvId, filesMap, (rec && rec.versions) || [])
+            idbGetProject(convId).then(rec =>
+              idbSaveProject(convId, filesMap, (rec && rec.versions) || [])
             ).catch(() => {});
           } catch (_) {}
         }
@@ -3856,7 +3873,7 @@ async function doChat(text, isRetry = false, opts = {}) {
       // 项目式编程：收集所有带文件名的代码块，渲染项目卡片（文件树 + 下载 ZIP）
       if (isProject) {
         const pfiles = collectProjectFiles(aiBubble);
-        if (pfiles.length) renderProjectCard(aiBubble, pfiles);
+        if (pfiles.length) renderProjectCard(aiBubble, pfiles, convId);
       }
       // 付费模型消费后仅刷新菜单里的额度显示，不再弹 toast 打扰用户
       if (data.spend && data.spend.cost > 0) refreshSpendDisplay();
@@ -3869,27 +3886,28 @@ async function doChat(text, isRetry = false, opts = {}) {
   try {
     // 禁用期内禁止对话
 
-    // 确保本地对话（新建或复用），并保存当前用户消息（数据只存使用用户设备）
-    const conv = ensureConversation(currentConvId, currentModel);
-    if (!currentConvId) {
-      currentConvId = conv.id;
+    // 确保本地对话（新建或复用）；重试时复用上一条用户消息，不重复写入
+    const conv = ensureConversation(convId, currentModel);
+    if (!isRetry) {
+      appendConvMessage(convId, { role: 'user', content: text });
+      try { bindLastUserEdit(); } catch (_) {}
+      dispatch('start', { conversation_id: convId, title: conv.title, user_message_id: 0 });
+    }
+    if (isNewConv && !isRetry) {
       const t0 = textStr.replace(/\s+/g, ' ').trim().slice(0, 12) || '新对话';
-      setConvTitle(conv.id, t0);
+      setConvTitle(convId, t0);
       $('chat-title').textContent = t0;
     }
-    appendConvMessage(currentConvId, { role: 'user', content: text });
-    try { bindLastUserEdit(); } catch (_) {}
-    dispatch('start', { conversation_id: currentConvId, title: conv.title, user_message_id: 0 });
     loadConversations();
 
     if (isProject) {
       // 项目式编程：重新生成前快照本设备 IndexedDB 工作区为新版本
-      try { await idbSnapshotProject(currentConvId); } catch (_) {}
+      try { await idbSnapshotProject(convId); } catch (_) {}
 
       // 沙箱改为「按需惰性」：AI 不输出 shell 块就完全不初始化；初始化失败也不阻塞项目生成
       let sandbox = null;
       if (IS_NATIVE) {
-        const projectDir = 'projects/' + currentConvId;
+        const projectDir = 'projects/' + convId;
         let projTerm = null;
         sandbox = {
           projectDir,
@@ -3917,6 +3935,7 @@ async function doChat(text, isRetry = false, opts = {}) {
         rawText: text, modelId: currentModel,
         emit: (event, data) => dispatch(event, data),
         sandbox,
+        signal: chatAbort ? chatAbort.signal : undefined,
       });
       window._lastProjectFiles = finalFiles; // 供 HTML 预览内联 CSS/JS 使用
       if (sandbox && sandbox.term) {
@@ -3926,7 +3945,7 @@ async function doChat(text, isRetry = false, opts = {}) {
       // 保存 assistant 汇总消息到本地对话
       const summary = '项目已分步生成完成，共 ' + finalFiles.length + ' 个文件：\n' +
         finalFiles.map(f => '- ' + f.path).join('\n') + '\n\n可点击「下载 ZIP」获取完整代码。';
-      appendConvMessage(currentConvId, { role: 'assistant', content: summary });
+      appendConvMessage(convId, { role: 'assistant', content: summary });
       await persistState();
       loadConversations();
     } else {
@@ -3958,7 +3977,7 @@ async function doChat(text, isRetry = false, opts = {}) {
       }
       const messages = [
         { role: 'system', content: CHAT_SYSTEM_PROMPT + searchNote },
-        ...buildLocalHistory(currentConvId),
+        ...buildLocalHistory(convId),
       ];
       const full = await localChatStream({
         modelId: currentModel,
@@ -3969,8 +3988,16 @@ async function doChat(text, isRetry = false, opts = {}) {
         onThink: (t) => dispatch('think', { text: t }),
         onVoice: (a) => dispatch('voice', { data: a.data }),
         signal: chatAbort ? chatAbort.signal : undefined,
+        onReset: () => {
+          // 供应商中途失败换源：清掉半截正文/思考，避免两段回答拼接
+          cancelRender();
+          received = ''; contentBuf = ''; thinkingText = '';
+          const tb = aiBubble.querySelector('.think-box');
+          if (tb) tb.remove();
+        },
       });
-      appendConvMessage(currentConvId, { role: 'assistant', content: full });
+      // 落库只存清洗后的正文，不能把 <think> 思考标签写进历史
+      appendConvMessage(convId, { role: 'assistant', content: received || full });
       await persistState();
       dispatch('done', {});
     }
@@ -4117,14 +4144,16 @@ async function doGenerate(prompt, kind) {
     }
   };
   try {
-    // 本地对话管理：保存用户 prompt
-    const conv = ensureConversation(currentConvId, currentModel);
-    if (!currentConvId) {
-      currentConvId = conv.id;
+    // 本地对话管理：锁定本次生成所属对话，切会话时结果仍回到原对话
+    const isNewConv = !currentConvId;
+    const convId = currentConvId || nextConvId();
+    if (!currentConvId) currentConvId = convId;
+    ensureConversation(convId, currentModel);
+    if (isNewConv) {
       const t0 = prompt.replace(/\s+/g, ' ').trim().slice(0, 12) || '新对话';
-      setConvTitle(conv.id, t0); $('chat-title').textContent = t0;
+      setConvTitle(convId, t0); $('chat-title').textContent = t0;
     }
-    appendConvMessage(currentConvId, { role: 'user', content: prompt });
+    appendConvMessage(convId, { role: 'user', content: prompt });
     // 生成类（图片/视频/语音）仅智谱支持；若当前选的是 poixe 模型则自动用智谱对应模型
     const apiModel = String(currentModel).startsWith('poixe:')
       ? { image_gen: 'cogview-3-flash', video_gen: 'cogvideox-flash', tts: 'glm-tts' }[kind]
@@ -4134,7 +4163,7 @@ async function doGenerate(prompt, kind) {
       setHint('正在直连智谱生成图片…');
       const url = await zhipuImage(apiModel, prompt);
       renderResult({ type: 'image', url });
-      appendConvMessage(currentConvId, { role: 'assistant', content: '图片：' + url });
+      appendConvMessage(convId, { role: 'assistant', content: '图片：' + url });
     } else if (kind === 'video_gen') {
       setHint('正在提交视频任务…');
       const created = await zhipuVideoCreate(apiModel, prompt);
@@ -4151,7 +4180,7 @@ async function doGenerate(prompt, kind) {
       }
       if (!url) throw new Error('视频生成超时');
       renderResult({ type: 'video', url });
-      appendConvMessage(currentConvId, { role: 'assistant', content: '视频：' + url });
+      appendConvMessage(convId, { role: 'assistant', content: '视频：' + url });
     } else if (kind === 'tts') {
       setHint('正在合成语音…');
       const ab = await zhipuTTS(apiModel, prompt);
@@ -4159,7 +4188,7 @@ async function doGenerate(prompt, kind) {
       const reader64 = new FileReader();
       const b64 = await new Promise((res) => { reader64.onload = () => res(reader64.result.split(',')[1]); reader64.readAsDataURL(blob); });
       renderResult({ type: 'audio', data: b64 });
-      appendConvMessage(currentConvId, { role: 'assistant', content: '语音合成完成' });
+      appendConvMessage(convId, { role: 'assistant', content: '语音合成完成' });
     }
     await persistState();
     loadConversations();
@@ -4235,8 +4264,14 @@ function refreshBanUI() {
 
 // ========== 用户操作 ==========
 $('btn-logout').onclick = async () => {
-  await api('/api/logout', { method: 'POST' });
-  location.reload();
+  try {
+    await api('/api/logout', { method: 'POST' });
+  } catch (_) {
+    // 后端不可达时也允许本地退出，否则按钮会卡住不跳转
+  } finally {
+    setAuth(null);
+    location.reload();
+  }
 };
 $('btn-edit-profile').onclick = () => {
   openAppModal({
@@ -4288,14 +4323,8 @@ $('btn-bind-confirm').onclick = submitBindEmail;
 $('bind-email-input').addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); $('bind-password-input').focus(); } });
 $('bind-password-input').addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); submitBindEmail(); } });
 
-// ========== 消息区事件委托：点击用户消息可修改 + 代码块复制/下载/预览 ==========
+// ========== 消息区事件委托：代码块复制/下载/预览（用户消息编辑由 attachUserEdit 统一处理） ==========
 $('messages').addEventListener('click', (e) => {
-  const userMsg = e.target.closest('.msg.user');
-  if (userMsg && !userMsg.dataset.editing) {
-    userMsg.dataset.editing = '1';
-    startEditUserMessage(userMsg);
-    return;
-  }
   const codeBtn = e.target.closest('.code-actions .code-act');
   if (codeBtn) {
     handleCodeAction(codeBtn);
@@ -4306,7 +4335,8 @@ $('messages').addEventListener('click', (e) => {
 // ========== 启动（v3.27.2：邮箱登录，封禁状态从后端获取） ==========
 (async () => {
   await silentLoad();
-  await persistState().catch(() => {});
+  // 注意：这里不能 persistState。silentLoad 读不出有效数据时是空状态，
+  // 先落盘会把原始备份覆盖成“合法空备份”，随后 verifyAndRestore 再也无法识别/恢复。
   try { reportEvent('app_open', { model: currentModel }); } catch (_) {}
 
   const saved = getAuth();
@@ -4323,8 +4353,8 @@ $('messages').addEventListener('click', (e) => {
       await afterLogin(user);
       return;
     } catch (e) {
-      // token 失效或后端不可达 → 回登录页
-      setAuth(null);
+      // 只有明确的 401 才清登录态；网络不可达不应把用户踢下线并丢失 token
+      if (e && e.status === 401) setAuth(null);
     }
   }
   authScreen.classList.remove('hidden');
@@ -4376,10 +4406,17 @@ pingBackend();
 // ============ 设置面板 ============
 let sandboxMode = 'native';
 let autoExec = true;
+let termFontSize = 13;
 try {
   sandboxMode = localStorage.getItem('aichat-sandbox-mode') || 'native';
   autoExec = localStorage.getItem('aichat-auto-exec') !== '0';
+  const savedFont = Number(localStorage.getItem('aichat-term-font'));
+  if (savedFont >= 11 && savedFont <= 18) termFontSize = savedFont;
 } catch (_) {}
+function applyTermFontSize() {
+  try { document.documentElement.style.setProperty('--term-font-size', termFontSize + 'px'); } catch (_) {}
+}
+applyTermFontSize();
 
 $('btn-settings').onclick = () => {
   $('settings-modal').classList.remove('hidden');
@@ -4387,11 +4424,19 @@ $('btn-settings').onclick = () => {
     r.checked = r.value === sandboxMode;
   });
   $('setting-auto-exec').checked = autoExec;
+  const fontRange = $('setting-term-font');
+  if (fontRange) fontRange.value = String(termFontSize);
 };
 $('settings-close').onclick = () => $('settings-modal').classList.add('hidden');
 $('settings-modal').addEventListener('click', e => {
   if (e.target === $('settings-modal')) $('settings-modal').classList.add('hidden');
 });
+$('setting-term-font').oninput = (e) => {
+  const v = Number(e.target.value);
+  termFontSize = Math.max(11, Math.min(18, v || 13));
+  applyTermFontSize();
+  try { localStorage.setItem('aichat-term-font', String(termFontSize)); } catch (_) {}
+};
 document.querySelectorAll('input[name="sandbox-mode"]').forEach(r => {
   r.onchange = () => {
     sandboxMode = r.value;
@@ -4678,7 +4723,9 @@ async function initFloatingTerminal() {
   }
 
   function switchSession(i) {
-    if (activeIdx >= 0 && sessions[activeIdx]) body.removeChild(sessions[activeIdx].el);
+    if (activeIdx >= 0 && sessions[activeIdx] && sessions[activeIdx].el.parentNode === body) {
+      body.removeChild(sessions[activeIdx].el);
+    }
     activeIdx = i;
     body.appendChild(sessions[i].el);
     renderTabs();
@@ -4688,7 +4735,8 @@ async function initFloatingTerminal() {
   function closeSession(i) {
     const s = sessions[i];
     if (s.busy) { s.line('命令正在执行，无法关闭', 'term-err'); return; }
-    body.removeChild(s.el);
+    // 只有当前活动会话的 DOM 挂在 body 上；关闭后台标签页时不能 removeChild
+    if (s.el.parentNode === body) body.removeChild(s.el);
     sessions.splice(i, 1);
     if (sessions.length === 0) {
       closeModal();
@@ -4696,7 +4744,7 @@ async function initFloatingTerminal() {
     }
     if (activeIdx >= sessions.length) activeIdx = sessions.length - 1;
     else if (activeIdx > i) activeIdx--;
-    body.appendChild(sessions[activeIdx].el);
+    if (sessions[activeIdx].el.parentNode !== body) body.appendChild(sessions[activeIdx].el);
     renderTabs();
   }
 

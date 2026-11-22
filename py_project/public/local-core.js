@@ -22,7 +22,10 @@ const OPENROUTER_BASE = 'https://openrouter.ai/api/v1';
 const AGNES_KEY = '';
 const AGNES_BASE = 'https://api.agnes.ai/v1';
 // 后端上报地址（封禁/状态事件；为空则跳过上报，APK 离线可用）
-const BACKEND_BASE = '';
+// 优先读取菜单/历史版本写入的 apiBase，避免 APK 内所有代理请求都打到 https://localhost
+const BACKEND_BASE = (() => {
+  try { return String(localStorage.getItem('apiBase') || '').replace(/\/+$/, ''); } catch (_) { return ''; }
+})();
 // API 代理地址（避免 WebView CORS，所有模型请求走后端转发）
 const PROXY_BASE = BACKEND_BASE + '/api/proxy/chat';
 // 本地数据加密密钥（AES-GCM + HMAC）：每台设备首次运行时随机生成 64 字节并持久化，
@@ -394,7 +397,7 @@ function quotaRemainingDays() {
  * ============================================================ */
 const ZHIPU_HEADERS = { 'Authorization': 'Bearer ' + ZHIPU_KEY, 'Content-Type': 'application/json' };
 
-// 网络层 fetch 重试：仅对 TypeError（Failed to fetch，连接/解析失败）重试一次
+// 网络层 fetch 重试：仅对连接/解析类错误重试一次；AbortError 立即上抛，避免“停止”后还等 600ms 再打一次
 async function fetchWithRetry(url, opts = {}, retries = 1) {
   let lastErr;
   for (let i = 0; i <= retries; i++) {
@@ -402,10 +405,40 @@ async function fetchWithRetry(url, opts = {}, retries = 1) {
       return await fetch(url, opts);
     } catch (e) {
       lastErr = e;
+      const aborted = (e && e.name === 'AbortError') || (opts.signal && opts.signal.aborted);
+      if (aborted) break;
       if (i < retries) await new Promise(r => setTimeout(r, 600));
     }
   }
   throw lastErr;
+}
+
+function abortError() {
+  const e = new Error('已停止生成');
+  e.name = 'AbortError';
+  return e;
+}
+
+// 非流式请求统一走 /api/proxy/chat，避免去 Key 后直连空密钥必然 401
+async function proxyChatOnce(provider, body, signal) {
+  const res = await fetchWithRetry(PROXY_BASE, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ provider, body }), signal,
+  });
+  const j = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    const code = j.error?.code, msg = j.error?.message || j.message || ('请求失败 ' + res.status);
+    let friendly = String(msg);
+    if (/1113|余额不足|无可用资源|请充值|insufficient|balance/i.test(String(code) + ' ' + friendly)) {
+      friendly = '模型账户余额/资源不足，请充值或切换到免费模型';
+    } else if (/1305|429|限流|rate.?limit|访问量过大/i.test(String(code) + ' ' + friendly)) {
+      friendly = '模型当前访问量过大，请稍后再试或切换模型';
+    }
+    const err = new Error(friendly);
+    err.status = res.status;
+    throw err;
+  }
+  return j.choices?.[0]?.message?.content || '';
 }
 
 async function zhipuPost(path, body, signal) {
@@ -545,14 +578,12 @@ async function zhipuVideoResult(id) {
   const res = await fetch(ZHIPU_BASE + '/async-result/' + id, { headers: ZHIPU_HEADERS });
   return await res.json();
 }
-// 非流式一次性调用（项目编排用）
-async function zhipuOnce(messages, model, max_tokens) {
-  const res = await zhipuPost('/chat/completions', {
+// 非流式一次性调用（项目编排用）：走代理，非直连空密钥
+async function zhipuOnce(messages, model, max_tokens, signal) {
+  return proxyChatOnce('zhipu', {
     model, messages: sanitizeMessages(messages), stream: false,
     max_tokens: clampZhipuMaxTokens(model, max_tokens),
-  });
-  const j = await res.json();
-  return j.choices?.[0]?.message?.content || '';
+  }, signal);
 }
 
 /* ============================================================
@@ -626,7 +657,7 @@ async function openaiCompatStream({ base, key, model, messages, max_tokens, thin
 }
 
 // 统一聊天入口：多级 fallback，任何 provider 限流/失败都自动切换
-async function localChatStream({ modelId, messages, max_tokens, thinking, onDelta, onThink, onVoice, signal }) {
+async function localChatStream({ modelId, messages, max_tokens, thinking, onDelta, onThink, onVoice, signal, onReset }) {
   const { provider, apiModel } = resolveLocalModel(modelId);
   const fallbackChain = [];
 
@@ -655,19 +686,30 @@ async function localChatStream({ modelId, messages, max_tokens, thinking, onDelt
   }
 
   let lastErr = null;
+  let attempt = 0;
+  let emitted = false;
+  const deltaCb = onDelta ? (t) => { emitted = true; onDelta(t); } : null;
   for (const f of fallbackChain) {
+    if (signal && signal.aborted) throw abortError();
+    // 上一供应商已经吐了部分内容才失败：切换前清空半截正文，避免两段回答叠在一起
+    if (attempt > 0 && emitted) {
+      try { if (onReset) onReset(); } catch (_) {}
+      emitted = false;
+    }
+    attempt++;
     try {
       if (f.type === 'zhipu') {
-        return await zhipuChatStream({ model: f.model, messages, max_tokens, thinking, onDelta, onThink, onVoice, signal });
+        return await zhipuChatStream({ model: f.model, messages, max_tokens, thinking, onDelta: deltaCb, onThink, onVoice, signal });
       }
       if (f.type === 'openrouter') {
-        return await openaiCompatStream({ base: OPENROUTER_BASE, key: OPENROUTER_KEY, model: f.model, messages, max_tokens, thinking, onDelta, onThink, signal });
+        return await openaiCompatStream({ base: OPENROUTER_BASE, key: OPENROUTER_KEY, model: f.model, messages, max_tokens, thinking, onDelta: deltaCb, onThink, signal });
       }
       if (f.type === 'agnes') {
-        return await openaiCompatStream({ base: AGNES_BASE, key: AGNES_KEY, model: f.model, messages, max_tokens, thinking, onDelta, onThink, signal });
+        return await openaiCompatStream({ base: AGNES_BASE, key: AGNES_KEY, model: f.model, messages, max_tokens, thinking, onDelta: deltaCb, onThink, signal });
       }
-      return await openaiCompatStream({ base: f.base, key: POIXE_KEY, model: f.model, messages, max_tokens, thinking, onDelta, onThink, signal });
+      return await openaiCompatStream({ base: f.base, key: POIXE_KEY, model: f.model, messages, max_tokens, thinking, onDelta: deltaCb, onThink, signal });
     } catch (e) {
+      if ((e && e.name === 'AbortError') || (signal && signal.aborted)) throw abortError();
       lastErr = e;
     }
   }
@@ -675,48 +717,56 @@ async function localChatStream({ modelId, messages, max_tokens, thinking, onDelt
 }
 
 // 统一非流式入口（项目编排用）
-async function localOnce({ modelId, messages, max_tokens }) {
+async function localOnce({ modelId, messages, max_tokens, signal }) {
+  if (signal && signal.aborted) throw abortError();
   const { provider, apiModel } = resolveLocalModel(modelId);
-  if (provider === 'zhipu') return zhipuOnce(messages, apiModel, max_tokens);
+  if (provider === 'zhipu') return zhipuOnce(messages, apiModel, max_tokens, signal);
   if (provider === 'openrouter') {
-    const res = await fetchWithRetry(OPENROUTER_BASE + '/chat/completions', {
-      method: 'POST',
-      headers: { 'Authorization': 'Bearer ' + OPENROUTER_KEY, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ model: apiModel, messages, stream: false, max_tokens: max_tokens || 8000 }),
-    });
-    if (!res.ok) throw new Error('openrouter ' + res.status);
-    const j = await res.json();
-    return j.choices?.[0]?.message?.content || '';
+    return proxyChatOnce('openrouter', {
+      model: apiModel, messages, stream: false, max_tokens: max_tokens || 8000,
+    }, signal);
+  }
+  if (provider === 'agnes') {
+    return proxyChatOnce('agnes', {
+      model: apiModel, messages, stream: false, max_tokens: max_tokens || 8000,
+    }, signal);
   }
   for (const base of POIXE_ENDPOINTS) {
+    if (signal && signal.aborted) throw abortError();
     try {
-      const res = await fetch(base + '/chat/completions', {
+      const res = await fetchWithRetry(base + '/chat/completions', {
         method: 'POST',
         headers: { 'Authorization': 'Bearer ' + POIXE_KEY, 'Content-Type': 'application/json' },
         body: JSON.stringify({ model: apiModel, messages, stream: false, max_tokens: max_tokens || 8000 }),
+        signal,
       });
       if (!res.ok) throw new Error('poixe ' + res.status);
       const j = await res.json();
       const c = j.choices?.[0]?.message?.content;
       if (c) return c;
       throw new Error('empty content');
-    } catch (_) {}
+    } catch (e) {
+      if ((e && e.name === 'AbortError') || (signal && signal.aborted)) throw e;
+    }
   }
-  return zhipuOnce(messages, ZHIPU_FALLBACK_MODEL, max_tokens);
+  return zhipuOnce(messages, ZHIPU_FALLBACK_MODEL, max_tokens, signal);
 }
 
-// 项目编排专用：失败自动重试 2 次
+// 项目编排专用：失败自动重试 2 次；支持 AbortSignal，停止按钮可立即中断
 async function localOnceRetry(args, retries = 2) {
   let lastErr;
   for (let i = 0; i <= retries; i++) {
+    if (args.signal && args.signal.aborted) throw abortError();
     try {
       const r = await localOnce(args);
       if (r && r.trim().length > 20) return r;
       lastErr = new Error('返回内容过短');
     } catch (e) {
+      if ((e && e.name === 'AbortError') || (args.signal && args.signal.aborted)) throw abortError();
       lastErr = e;
     }
     await new Promise(r => setTimeout(r, 800 * (i + 1)));
+    if (args.signal && args.signal.aborted) throw abortError();
   }
   throw lastErr;
 }
@@ -1036,6 +1086,7 @@ function parseSteps(text) {
 // 本地项目编排（直连供应商，通过 emit 注入 plan/step/file/project_done 事件）
 // sandbox（可选）：{ term, projectDir, run, write } —— 提供时命令在本地沙箱真实执行
 async function localProjectChat({ rawText, modelId, emit, signal, sandbox = null }) {
+  if (signal && signal.aborted) throw abortError();
   // v3.29.2：项目式编程统一用 OpenRouter 代码模型，大 token，重试 2 次
   const CODE_MODEL = 'or:cohere/north-mini-code:free';
   const planText = await localOnceRetry({
@@ -1045,6 +1096,7 @@ async function localProjectChat({ rawText, modelId, emit, signal, sandbox = null
       { role: 'user', content: rawText },
     ],
     max_tokens: 16000,
+    signal,
   });
   let steps = parseSteps(planText);
   if (!steps.length) steps = [{ title: '整体实现', files: [] }];
@@ -1058,6 +1110,7 @@ async function localProjectChat({ rawText, modelId, emit, signal, sandbox = null
   let exeReport = '';
   let failures = [];
   for (let i = 0; i < steps.length; i++) {
+    if (signal && signal.aborted) throw abortError();
     emit('step_start', { index: i + 1, total: steps.length, title: steps[i].title });
     const existing = written.map(f => f.path).join(', ') || '（暂无）';
     const stepUser = [
@@ -1077,6 +1130,7 @@ async function localProjectChat({ rawText, modelId, emit, signal, sandbox = null
         { role: 'user', content: stepUser },
       ],
       max_tokens: 16000,
+      signal,
     });
     const reads = [...out.matchAll(/READ_FILE:\s*([^\n]+)/gi)].map(m => sanitizeRel(m[1])).filter(Boolean);
     if (reads.length) {
@@ -1143,8 +1197,12 @@ async function localProjectChat({ rawText, modelId, emit, signal, sandbox = null
             { role: 'user', content: fixUser },
           ],
           max_tokens: 16000,
+          signal,
         });
-      } catch (e) { break; }
+      } catch (e) {
+        if ((e && e.name === 'AbortError') || (signal && signal.aborted)) throw abortError();
+        break;
+      }
       const blocks = parseFileBlocks(out);
       if (!blocks.length) break;
       for (const b of blocks) {
