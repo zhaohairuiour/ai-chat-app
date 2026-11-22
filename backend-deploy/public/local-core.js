@@ -22,11 +22,33 @@ const OPENROUTER_BASE = 'https://openrouter.ai/api/v1';
 const AGNES_KEY = '';
 const AGNES_BASE = 'https://api.agnes.ai/v1';
 // 后端上报地址（封禁/状态事件；为空则跳过上报，APK 离线可用）
-const BACKEND_BASE = '';
+// 优先读取菜单/历史版本写入的 apiBase，避免 APK 内所有代理请求都打到 https://localhost
+const BACKEND_BASE = (() => {
+  try { return String(localStorage.getItem('apiBase') || '').replace(/\/+$/, ''); } catch (_) { return ''; }
+})();
 // API 代理地址（避免 WebView CORS，所有模型请求走后端转发）
 const PROXY_BASE = BACKEND_BASE + '/api/proxy/chat';
-// 应用内置密钥材料（AES-GCM 加密 + HMAC 签名 + 特殊编码 XOR 密钥流）
-const APP_SECRET_HEX = '9d863a2d9f3c098076bf0d7ebba20c0eebc259dd1849a938e1fb226af466b2190b3f95b48842ca84fccb2837a9cd4c7b1597e00b0009a19629f556e0b554d619';
+// 本地数据加密密钥（AES-GCM + HMAC）：每台设备首次运行时随机生成 64 字节并持久化，
+// APK 内不再内置固定密钥。LEGACY_SECRET_HEX 仅在解密升级前的历史数据时用作兼容回退，
+// 新旧数据读取成功后会自动用设备密钥重新加密（迁移）。
+const LEGACY_SECRET_HEX = '9d863a2d9f3c098076bf0d7ebba20c0eebc259dd1849a938e1fb226af466b2190b3f95b48842ca84fccb2837a9cd4c7b1597e00b0009a19629f556e0b554d619';
+const LS_APP_SECRET = 'aichat-app-secret';
+let _appSecretHex = null;
+function appSecretHex() {
+  if (_appSecretHex) return _appSecretHex;
+  try {
+    let s = localStorage.getItem(LS_APP_SECRET);
+    if (!s || !/^[0-9a-f]{128}$/i.test(s)) {
+      const b = crypto.getRandomValues(new Uint8Array(64));
+      s = Array.from(b, x => x.toString(16).padStart(2, '0')).join('');
+      localStorage.setItem(LS_APP_SECRET, s);
+    }
+    _appSecretHex = s.toLowerCase();
+  } catch (_) {
+    _appSecretHex = LEGACY_SECRET_HEX;   // localStorage 不可用的极端情形，保证功能可用
+  }
+  return _appSecretHex;
+}
 const XOR_SEED = [0x5a, 0x3c, 0x91, 0xe7, 0x28, 0xb4, 0x6d, 0xf0, 0x13, 0x7a, 0xc5, 0x82, 0x49, 0xde, 0x36, 0xab];
 
 // ============ 工具：hex / bytes ============
@@ -102,13 +124,32 @@ function specialDecode(str) {
 }
 
 // ============ Web Crypto 密钥（AES-GCM + HMAC） ============
-let _aesKey = null, _hmacKey = null;
+let _aesKey = null, _hmacKey = null, _legacyAes = null, _legacyHmac = null;
+async function importKeys(hex) {
+  const km = hexToBytes(hex);
+  const aes = await crypto.subtle.importKey('raw', km.slice(0, 32), { name: 'AES-GCM' }, false, ['encrypt', 'decrypt']);
+  const hmac = await crypto.subtle.importKey('raw', km.slice(32, 64), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign', 'verify']);
+  return { aes, hmac };
+}
 async function cryptoKeys() {
   if (_aesKey && _hmacKey) return { aes: _aesKey, hmac: _hmacKey };
-  const km = hexToBytes(APP_SECRET_HEX);
-  _aesKey = await crypto.subtle.importKey('raw', km.slice(0, 32), { name: 'AES-GCM' }, false, ['encrypt', 'decrypt']);
-  _hmacKey = await crypto.subtle.importKey('raw', km.slice(32, 64), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign', 'verify']);
-  return { aes: _aesKey, hmac: _hmacKey };
+  const k = await importKeys(appSecretHex());
+  _aesKey = k.aes; _hmacKey = k.hmac;
+  return k;
+}
+// 旧版内置密钥：仅用于兼容解密升级前的数据
+async function legacyKeys() {
+  if (_legacyAes && _legacyHmac) return { aes: _legacyAes, hmac: _legacyHmac };
+  const k = await importKeys(LEGACY_SECRET_HEX);
+  _legacyAes = k.aes; _legacyHmac = k.hmac;
+  return k;
+}
+async function verifyAndDecrypt(keys, iv, ct, sigInput, sig) {
+  try {
+    const ok = await crypto.subtle.verify('HMAC', keys.hmac, sig, sigInput);
+    if (!ok) return null;
+    return await crypto.subtle.decrypt({ name: 'AES-GCM', iv }, keys.aes, ct);
+  } catch (_) { return null; }
 }
 
 // ============ 信封：加密 + 签名 ============
@@ -130,22 +171,22 @@ async function sealEnvelope(obj) {
     sig: specialEncode(sig),
   });
 }
-// 信封字符串 → 验签 + 解密；任一失败抛异常
+// 信封字符串 → 验签 + 解密；当前设备密钥失败时回退旧内置密钥（兼容历史数据，成功后自动重新加密）
+let _needsRekey = false;
 async function openEnvelope(envStr) {
   const env = JSON.parse(envStr);
   if (!env || env.enc !== 'A256GCM-HMAC' || !env.iv || !env.data || !env.sig) throw new Error('bad envelope');
-  const { aes, hmac } = await cryptoKeys();
   const iv = specialDecode(env.iv);
   const ct = specialDecode(env.data);
   const sig = specialDecode(env.sig);
   const sigInput = new Uint8Array(iv.length + ct.length);
   sigInput.set(iv, 0); sigInput.set(ct, iv.length);
-  const ok = await crypto.subtle.verify('HMAC', hmac, sig, sigInput);
-  if (!ok) throw new Error('signature mismatch');
-  let plain;
-  try {
-    plain = await crypto.subtle.decrypt({ name: 'AES-GCM', iv }, aes, ct);
-  } catch (_) { throw new Error('decrypt failed'); }
+  let plain = await verifyAndDecrypt(await cryptoKeys(), iv, ct, sigInput, sig);
+  if (!plain) {
+    plain = await verifyAndDecrypt(await legacyKeys(), iv, ct, sigInput, sig);
+    if (plain) _needsRekey = true;
+  }
+  if (!plain) throw new Error('signature mismatch');
   return JSON.parse(new TextDecoder().decode(plain));
 }
 
@@ -356,7 +397,7 @@ function quotaRemainingDays() {
  * ============================================================ */
 const ZHIPU_HEADERS = { 'Authorization': 'Bearer ' + ZHIPU_KEY, 'Content-Type': 'application/json' };
 
-// 网络层 fetch 重试：仅对 TypeError（Failed to fetch，连接/解析失败）重试一次
+// 网络层 fetch 重试：仅对连接/解析类错误重试一次；AbortError 立即上抛，避免“停止”后还等 600ms 再打一次
 async function fetchWithRetry(url, opts = {}, retries = 1) {
   let lastErr;
   for (let i = 0; i <= retries; i++) {
@@ -364,10 +405,40 @@ async function fetchWithRetry(url, opts = {}, retries = 1) {
       return await fetch(url, opts);
     } catch (e) {
       lastErr = e;
+      const aborted = (e && e.name === 'AbortError') || (opts.signal && opts.signal.aborted);
+      if (aborted) break;
       if (i < retries) await new Promise(r => setTimeout(r, 600));
     }
   }
   throw lastErr;
+}
+
+function abortError() {
+  const e = new Error('已停止生成');
+  e.name = 'AbortError';
+  return e;
+}
+
+// 非流式请求统一走 /api/proxy/chat，避免去 Key 后直连空密钥必然 401
+async function proxyChatOnce(provider, body, signal) {
+  const res = await fetchWithRetry(PROXY_BASE, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ provider, body }), signal,
+  });
+  const j = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    const code = j.error?.code, msg = j.error?.message || j.message || ('请求失败 ' + res.status);
+    let friendly = String(msg);
+    if (/1113|余额不足|无可用资源|请充值|insufficient|balance/i.test(String(code) + ' ' + friendly)) {
+      friendly = '模型账户余额/资源不足，请充值或切换到免费模型';
+    } else if (/1305|429|限流|rate.?limit|访问量过大/i.test(String(code) + ' ' + friendly)) {
+      friendly = '模型当前访问量过大，请稍后再试或切换模型';
+    }
+    const err = new Error(friendly);
+    err.status = res.status;
+    throw err;
+  }
+  return j.choices?.[0]?.message?.content || '';
 }
 
 async function zhipuPost(path, body, signal) {
@@ -386,9 +457,66 @@ async function zhipuPost(path, body, signal) {
 }
 
 // 聊天 SSE：回调 onDelta/onThink/onVoice/onUsage，返回完整正文
+// GLM-4V 系列多模态模型 max_tokens 上限 1024，传 8192 会被判 "参数非法"（code 1210）；
+// 同时历史里重复携带旧图片会让 body 暴涨且触发格式校验，这里统一清洗。
+function clampZhipuMaxTokens(model, maxTokens) {
+  const isVision = /glm-4v|glm-4\.5v|glm-4\.1v|vision/i.test(String(model || ''));
+  const cap = isVision ? 1024 : 8192;
+  return Math.max(1, Math.min(maxTokens || cap, cap));
+}
+
+function sanitizeMessages(messages, { keepLastImages = 1 } = {}) {
+  const src = Array.isArray(messages) ? messages : [];
+  let lastUserIdx = -1;
+  src.forEach((m, i) => { if (m && m.role === 'user') lastUserIdx = i; });
+  const out = [];
+  for (let i = 0; i < src.length; i++) {
+    const m = src[i];
+    if (!m || !m.role) continue;
+    let content = m.content;
+    if (Array.isArray(content)) {
+      const isLastUser = i === lastUserIdx && keepLastImages > 0;
+      const parts = content.map(p => {
+        if (!p || typeof p !== 'object') return null;
+        if (p.type === 'text') {
+          const t = String(p.text || '');
+          return t.trim() ? { type: 'text', text: t } : null;
+        }
+        if (p.type === 'image_url') {
+          const url = (p.image_url && p.image_url.url) || '';
+          if (isLastUser && url) return { type: 'image_url', image_url: { url } };
+          return { type: 'text', text: '【图片】' };
+        }
+        if (p.type === 'video_url') return { type: 'text', text: '【视频】' };
+        if (p.type === 'input_audio') return { type: 'text', text: '【语音】' };
+        if (p.type === 'file') return { type: 'text', text: '【文件】' };
+        return null;
+      }).filter(Boolean);
+      if (!parts.length) continue;
+      content = parts;
+    } else {
+      content = String(content == null ? '' : content);
+      if (!content.trim()) continue;
+    }
+    const prev = out[out.length - 1];
+    if (prev && prev.role === m.role) {
+      if (typeof prev.content === 'string' && typeof content === 'string') {
+        prev.content += '\n' + content;
+        continue;
+      }
+      continue;
+    }
+    out.push({ role: m.role, content });
+  }
+  return out;
+}
+
 async function zhipuChatStream({ model, messages, max_tokens, thinking, onDelta, onThink, onVoice, onUsage, signal }) {
-  const reqBody = { model, messages, stream: true, max_tokens: max_tokens || 8192 };
-  if (thinking) reqBody.thinking = { type: 'enabled' };
+  const safeMessages = sanitizeMessages(messages);
+  const vision = /glm-4v|glm-4\.5v|glm-4\.1v|vision/i.test(String(model || ''));
+  const reqBody = { model, messages: safeMessages, stream: true, max_tokens: clampZhipuMaxTokens(model, max_tokens) };
+  // 视觉模型不支持 thinking 参数，带上会被判 1210 参数非法
+  if (thinking && !vision) reqBody.thinking = { type: 'enabled' };
   // 走后端代理避免 CORS
   const res = await fetchWithRetry(PROXY_BASE, {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
@@ -450,11 +578,12 @@ async function zhipuVideoResult(id) {
   const res = await fetch(ZHIPU_BASE + '/async-result/' + id, { headers: ZHIPU_HEADERS });
   return await res.json();
 }
-// 非流式一次性调用（项目编排用）
-async function zhipuOnce(messages, model, max_tokens) {
-  const res = await zhipuPost('/chat/completions', { model, messages, stream: false, max_tokens: max_tokens || 8000 });
-  const j = await res.json();
-  return j.choices?.[0]?.message?.content || '';
+// 非流式一次性调用（项目编排用）：走代理，非直连空密钥
+async function zhipuOnce(messages, model, max_tokens, signal) {
+  return proxyChatOnce('zhipu', {
+    model, messages: sanitizeMessages(messages), stream: false,
+    max_tokens: clampZhipuMaxTokens(model, max_tokens),
+  }, signal);
 }
 
 /* ============================================================
@@ -528,7 +657,7 @@ async function openaiCompatStream({ base, key, model, messages, max_tokens, thin
 }
 
 // 统一聊天入口：多级 fallback，任何 provider 限流/失败都自动切换
-async function localChatStream({ modelId, messages, max_tokens, thinking, onDelta, onThink, onVoice, signal }) {
+async function localChatStream({ modelId, messages, max_tokens, thinking, onDelta, onThink, onVoice, signal, onReset }) {
   const { provider, apiModel } = resolveLocalModel(modelId);
   const fallbackChain = [];
 
@@ -557,19 +686,30 @@ async function localChatStream({ modelId, messages, max_tokens, thinking, onDelt
   }
 
   let lastErr = null;
+  let attempt = 0;
+  let emitted = false;
+  const deltaCb = onDelta ? (t) => { emitted = true; onDelta(t); } : null;
   for (const f of fallbackChain) {
+    if (signal && signal.aborted) throw abortError();
+    // 上一供应商已经吐了部分内容才失败：切换前清空半截正文，避免两段回答叠在一起
+    if (attempt > 0 && emitted) {
+      try { if (onReset) onReset(); } catch (_) {}
+      emitted = false;
+    }
+    attempt++;
     try {
       if (f.type === 'zhipu') {
-        return await zhipuChatStream({ model: f.model, messages, max_tokens, thinking, onDelta, onThink, onVoice, signal });
+        return await zhipuChatStream({ model: f.model, messages, max_tokens, thinking, onDelta: deltaCb, onThink, onVoice, signal });
       }
       if (f.type === 'openrouter') {
-        return await openaiCompatStream({ base: OPENROUTER_BASE, key: OPENROUTER_KEY, model: f.model, messages, max_tokens, thinking, onDelta, onThink, signal });
+        return await openaiCompatStream({ base: OPENROUTER_BASE, key: OPENROUTER_KEY, model: f.model, messages, max_tokens, thinking, onDelta: deltaCb, onThink, signal });
       }
       if (f.type === 'agnes') {
-        return await openaiCompatStream({ base: AGNES_BASE, key: AGNES_KEY, model: f.model, messages, max_tokens, thinking, onDelta, onThink, signal });
+        return await openaiCompatStream({ base: AGNES_BASE, key: AGNES_KEY, model: f.model, messages, max_tokens, thinking, onDelta: deltaCb, onThink, signal });
       }
-      return await openaiCompatStream({ base: f.base, key: POIXE_KEY, model: f.model, messages, max_tokens, thinking, onDelta, onThink, signal });
+      return await openaiCompatStream({ base: f.base, key: POIXE_KEY, model: f.model, messages, max_tokens, thinking, onDelta: deltaCb, onThink, signal });
     } catch (e) {
+      if ((e && e.name === 'AbortError') || (signal && signal.aborted)) throw abortError();
       lastErr = e;
     }
   }
@@ -577,48 +717,56 @@ async function localChatStream({ modelId, messages, max_tokens, thinking, onDelt
 }
 
 // 统一非流式入口（项目编排用）
-async function localOnce({ modelId, messages, max_tokens }) {
+async function localOnce({ modelId, messages, max_tokens, signal }) {
+  if (signal && signal.aborted) throw abortError();
   const { provider, apiModel } = resolveLocalModel(modelId);
-  if (provider === 'zhipu') return zhipuOnce(messages, apiModel, max_tokens);
+  if (provider === 'zhipu') return zhipuOnce(messages, apiModel, max_tokens, signal);
   if (provider === 'openrouter') {
-    const res = await fetchWithRetry(OPENROUTER_BASE + '/chat/completions', {
-      method: 'POST',
-      headers: { 'Authorization': 'Bearer ' + OPENROUTER_KEY, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ model: apiModel, messages, stream: false, max_tokens: max_tokens || 8000 }),
-    });
-    if (!res.ok) throw new Error('openrouter ' + res.status);
-    const j = await res.json();
-    return j.choices?.[0]?.message?.content || '';
+    return proxyChatOnce('openrouter', {
+      model: apiModel, messages, stream: false, max_tokens: max_tokens || 8000,
+    }, signal);
+  }
+  if (provider === 'agnes') {
+    return proxyChatOnce('agnes', {
+      model: apiModel, messages, stream: false, max_tokens: max_tokens || 8000,
+    }, signal);
   }
   for (const base of POIXE_ENDPOINTS) {
+    if (signal && signal.aborted) throw abortError();
     try {
-      const res = await fetch(base + '/chat/completions', {
+      const res = await fetchWithRetry(base + '/chat/completions', {
         method: 'POST',
         headers: { 'Authorization': 'Bearer ' + POIXE_KEY, 'Content-Type': 'application/json' },
         body: JSON.stringify({ model: apiModel, messages, stream: false, max_tokens: max_tokens || 8000 }),
+        signal,
       });
       if (!res.ok) throw new Error('poixe ' + res.status);
       const j = await res.json();
       const c = j.choices?.[0]?.message?.content;
       if (c) return c;
       throw new Error('empty content');
-    } catch (_) {}
+    } catch (e) {
+      if ((e && e.name === 'AbortError') || (signal && signal.aborted)) throw e;
+    }
   }
-  return zhipuOnce(messages, ZHIPU_FALLBACK_MODEL, max_tokens);
+  return zhipuOnce(messages, ZHIPU_FALLBACK_MODEL, max_tokens, signal);
 }
 
-// 项目编排专用：失败自动重试 2 次
+// 项目编排专用：失败自动重试 2 次；支持 AbortSignal，停止按钮可立即中断
 async function localOnceRetry(args, retries = 2) {
   let lastErr;
   for (let i = 0; i <= retries; i++) {
+    if (args.signal && args.signal.aborted) throw abortError();
     try {
       const r = await localOnce(args);
       if (r && r.trim().length > 20) return r;
       lastErr = new Error('返回内容过短');
     } catch (e) {
+      if ((e && e.name === 'AbortError') || (args.signal && args.signal.aborted)) throw abortError();
       lastErr = e;
     }
     await new Promise(r => setTimeout(r, 800 * (i + 1)));
+    if (args.signal && args.signal.aborted) throw abortError();
   }
   throw lastErr;
 }
@@ -670,6 +818,7 @@ async function silentLoad() {
       const obj = await openEnvelope(raw).catch(() => null);
       if (obj && obj.version === 1 && Array.isArray(obj.conversations)) {
         localState = obj;
+        if (_needsRekey) { _needsRekey = false; try { await persistState(); } catch (_) {} }
         return;
       }
     } catch (_) {}
@@ -788,6 +937,7 @@ try { window.reportEvent = reportEvent; } catch (_) {}
  * 内置模型清单（与网站 /api/models 下发的智谱部分一致）
  * ============================================================ */
 const LOCAL_MODELS = [
+  { id: 'openclaw:agent', name: 'OpenClaw（本地执行）', caps: [], kind: 'agent', enabled: true },
   { id: 'zhipu:glm-4-flash-250414', name: 'GLM-4-Flash', caps: [], kind: 'chat', enabled: true },
   { id: 'zhipu:glm-4.5-flash', name: 'GLM-4.5-Flash', caps: [], kind: 'chat', enabled: true },
   { id: 'zhipu:glm-4.7-flash', name: 'GLM-4.7-Flash', caps: [], kind: 'chat', enabled: true },
@@ -936,6 +1086,7 @@ function parseSteps(text) {
 // 本地项目编排（直连供应商，通过 emit 注入 plan/step/file/project_done 事件）
 // sandbox（可选）：{ term, projectDir, run, write } —— 提供时命令在本地沙箱真实执行
 async function localProjectChat({ rawText, modelId, emit, signal, sandbox = null }) {
+  if (signal && signal.aborted) throw abortError();
   // v3.29.2：项目式编程统一用 OpenRouter 代码模型，大 token，重试 2 次
   const CODE_MODEL = 'or:cohere/north-mini-code:free';
   const planText = await localOnceRetry({
@@ -945,6 +1096,7 @@ async function localProjectChat({ rawText, modelId, emit, signal, sandbox = null
       { role: 'user', content: rawText },
     ],
     max_tokens: 16000,
+    signal,
   });
   let steps = parseSteps(planText);
   if (!steps.length) steps = [{ title: '整体实现', files: [] }];
@@ -958,6 +1110,7 @@ async function localProjectChat({ rawText, modelId, emit, signal, sandbox = null
   let exeReport = '';
   let failures = [];
   for (let i = 0; i < steps.length; i++) {
+    if (signal && signal.aborted) throw abortError();
     emit('step_start', { index: i + 1, total: steps.length, title: steps[i].title });
     const existing = written.map(f => f.path).join(', ') || '（暂无）';
     const stepUser = [
@@ -977,6 +1130,7 @@ async function localProjectChat({ rawText, modelId, emit, signal, sandbox = null
         { role: 'user', content: stepUser },
       ],
       max_tokens: 16000,
+      signal,
     });
     const reads = [...out.matchAll(/READ_FILE:\s*([^\n]+)/gi)].map(m => sanitizeRel(m[1])).filter(Boolean);
     if (reads.length) {
@@ -1043,8 +1197,12 @@ async function localProjectChat({ rawText, modelId, emit, signal, sandbox = null
             { role: 'user', content: fixUser },
           ],
           max_tokens: 16000,
+          signal,
         });
-      } catch (e) { break; }
+      } catch (e) {
+        if ((e && e.name === 'AbortError') || (signal && signal.aborted)) throw abortError();
+        break;
+      }
       const blocks = parseFileBlocks(out);
       if (!blocks.length) break;
       for (const b of blocks) {

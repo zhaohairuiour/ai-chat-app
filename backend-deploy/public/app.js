@@ -37,6 +37,8 @@ let currentNode = 0;
 
 // 联网三态开关：'auto' = AI 自动判断；'on' = 强制联网；'off' = 完全不联网
 let webMode = 'auto';
+// 自动联网的触发规则：时效性/事实性/对比类问题才搜，创作与闲聊不搜
+const NEED_SEARCH_RE = /(最新|今天|今日|现在|近期|最近|价格|报价|多少钱|新闻|资讯|政策|发布|上市|股价|行情|天气|哪家|哪个好|对比|评测|推荐|搜一下|查一下|搜索|联网|官网|版本号)/i;
 
 // ========== 技能系统（字段化模板，去除硬编码） ==========
 // 每个技能由 fields + buildPrompt 组成；fields 为空时等同普通输入
@@ -311,7 +313,11 @@ const API_BASE = (localStorage.getItem('apiBase') || DEFAULT_API_BASE).replace(/
 // 登录凭据（token + 用户信息）：登录成功后保存，下次自动登录
 const AUTH_KEY = 'ai-chat-auth';
 function getAuth() { try { return JSON.parse(localStorage.getItem(AUTH_KEY) || 'null'); } catch (_) { return null; } }
-function setAuth(v) { try { if (v) localStorage.setItem(AUTH_KEY, JSON.stringify(v)); else localStorage.removeItem(AUTH_KEY); } catch (_) {} }
+function setAuth(v) {
+  try { if (v) localStorage.setItem(AUTH_KEY, JSON.stringify(v)); else localStorage.removeItem(AUTH_KEY); } catch (_) {}
+  // 登录态变化时刷新依赖登录的功能入口（终端悬浮按钮等）
+  try { window.dispatchEvent(new Event('aichat:auth-changed')); } catch (_) {}
+}
 function authToken() { const a = getAuth(); return (a && a.token) || ''; }
 
 // ========== 本地沙箱（v3.28：仅 APK 原生环境可用） ==========
@@ -346,6 +352,20 @@ let _activeStreamTerm = null;
 function showBootProgress(label) {
   const box = $('boot-progress');
   if (!box) return;
+  const modal = document.getElementById('term-modal');
+  const termVisible = !!(modal && !modal.classList.contains('hidden'));
+  // 终端面板可见时进度只画在终端内（#term-progress），页面顶部这条一定隐藏，
+  // 否则初始化与 OpenClaw 解压会同时出现两条一模一样的进度条
+  if (termVisible || /OpenClaw/i.test(String(label || ''))) {
+    box.classList.add('hidden');
+    const tBox = document.getElementById('term-progress');
+    const tLabel = document.getElementById('term-progress-label');
+    if (termVisible && tBox && label) {
+      tBox.classList.remove('hidden');
+      if (tLabel) tLabel.textContent = label;
+    }
+    return;
+  }
   box.classList.remove('hidden', 'indeterminate');
   if (label) $('boot-progress-label').textContent = label;
 }
@@ -356,9 +376,35 @@ function updateBootProgress(text) {
   if (!m) return;
   const done = +m[1], total = +m[2] || 1;
   const pct = Math.min(100, Math.round(done / total * 100));
-  box.classList.remove('hidden', 'indeterminate');
-  $('boot-progress-fill').style.width = pct + '%';
-  $('boot-progress-label').textContent = '正在解压运行环境 ' + pct + '%（' + done + '/' + total + '）';
+  const isOpenclaw = /OpenClaw/i.test(String(text || ''));
+  const labelEl = $('boot-progress-label');
+  if (labelEl) labelEl.textContent = (isOpenclaw ? '正在安装 OpenClaw 运行时 ' : '正在解压运行环境 ') + pct + '%';
+  const tip = window.__ocInstallTip;
+  if (tip) tip.textContent = '正在安装 OpenClaw 运行时 ' + pct + '%';
+  // OpenClaw 的进度只画在终端内那一条上，页面顶部的 boot-progress 同时显示会出现两条
+  if (isOpenclaw) {
+    box.classList.add('hidden');
+  } else {
+    box.classList.remove('hidden', 'indeterminate');
+    $('boot-progress-fill').style.width = pct + '%';
+    $('boot-progress-label').textContent = '正在解压运行环境 ' + pct + '%（' + done + '/' + total + '）';
+  }
+  // 终端内的同款进度条（聊天页的 #boot-progress 会被全屏终端遮住）
+  const tBox = document.getElementById('term-progress');
+  const tFill = document.getElementById('term-progress-fill');
+  const tLabel = document.getElementById('term-progress-label');
+  if (tBox && tFill) {
+    tBox.classList.remove('hidden');
+    tFill.style.width = pct + '%';
+    if (tLabel) {
+      tLabel.textContent = (isOpenclaw ? '正在解压 OpenClaw 运行时 ' : '正在解压运行环境 ')
+        + pct + '%（' + done + '/' + total + '）';
+    }
+    if (pct >= 100) {
+      if (tLabel) tLabel.textContent = '解压完成，正在配置环境…';
+      setTimeout(() => tBox.classList.add('hidden'), 1500);
+    }
+  }
   if (pct >= 100) {
     $('boot-progress-label').textContent = '解压完成，正在配置环境…';
     setTimeout(() => box.classList.add('hidden'), 2500);
@@ -367,6 +413,14 @@ function updateBootProgress(text) {
 function hideBootProgress() {
   const box = $('boot-progress');
   if (box) box.classList.add('hidden');
+  // 终端内同款进度条也要一并隐藏，否则初始化已就绪后 #term-progress 仍卡在
+  // 「正在准备运行环境」；解压满 100% 之外的路径（已安装、无进度事件）只走到这里
+  const tBox = document.getElementById('term-progress');
+  if (tBox) {
+    tBox.classList.add('hidden');
+    const tFill = document.getElementById('term-progress-fill');
+    if (tFill) tFill.style.width = '0%';
+  }
 }
 
 async function ensureSandbox() {
@@ -388,19 +442,69 @@ async function ensureSandbox() {
                 _lastSandboxSeq = seq;
               }
               if (ev.stream === 'progress') { updateBootProgress(ev.text); return; }
+              // Agent 运行时把最新一行原生输出写进气泡，避免长时间空白等结果
+              if (window.__agentBubble && (ev.stream === 'stdout' || ev.stream === 'output')) {
+                const raw = String(ev.text || '').replace(/\s+$/, '');
+                const hint = window.__agentBubble.querySelector && window.__agentBubble.querySelector('.typing-hint');
+                if (hint && raw && !raw.startsWith('{') && !raw.startsWith('[state/')) {
+                  hint.textContent = raw.length > 72 ? raw.slice(0, 72) + '…' : raw;
+                }
+                // 完整日志实时写进气泡下的可展开区，不依赖终端
+                const logBox = window.__agentLogBox;
+                if (logBox && raw) {
+                  const line = document.createElement('div');
+                  line.textContent = raw;
+                  logBox.appendChild(line);
+                  while (logBox.childNodes.length > 300) logBox.removeChild(logBox.firstChild);
+                  logBox.scrollTop = logBox.scrollHeight;
+                }
+              }
               _streamTick++;
               const t = _activeStreamTerm || activeTerm;
-              if (t) t.pushStream(ev.stream, ev.text);
+              if (!t) {
+                // 终端没开也要留住 Agent 日志，避免用户只看得到对话里一行
+                if (ev.stream === 'stdout' || ev.stream === 'output') {
+                  window.__agentLogBuf = window.__agentLogBuf || [];
+                  window.__agentLogBuf.push(String(ev.text || '').replace(/\s+$/, ''));
+                  if (window.__agentLogBuf.length > 400) window.__agentLogBuf.shift();
+                }
+                return;
+              }
+              if (Array.isArray(ev.runs)) { t.pushRuns(ev.stream, ev.runs, !!ev.fin); return; }
+              t.pushStream(ev.stream, ev.text);
+            } catch (_) {}
+          });
+        } catch (_) {}
+        try {
+          await sb.addListener('screen', (ev) => { try { renderScreen(ev); } catch (_) {} });
+        } catch (_) {}
+        try {
+          await sb.addListener('progress', (ev) => {
+            try {
+              if (!ev) return;
+              const t = _activeStreamTerm || activeTerm;
+              if (!t || typeof t.progressRuns !== 'function') return;
+              if (Array.isArray(ev.runs)) { t.progressRuns(ev.runs); return; }
+              if (ev.text) t.progress(ev.text);
             } catch (_) {}
           });
         } catch (_) {}
         _sandboxListenerRegistered = true;
       }
-      showBootProgress('正在准备运行环境…');
-      const res = await Promise.race([
-        sb.init(),
-        new Promise((_, reject) => setTimeout(() => reject(new Error('初始化超时(120s)')), 120000))
-      ]);
+      showBootProgress('正在准备运行环境（首次约 1-2 分钟）…');
+      let res;
+      try {
+        res = await Promise.race([
+          sb.init(),
+          new Promise((_, reject) => setTimeout(() => reject(new Error('初始化超时(120s)')), 120000))
+        ]);
+      } catch (e) {
+        // 超时或原生抛错时要清掉进度条与初始化锁，否则会一直停在「正在准备运行环境」
+        hideBootProgress();
+        _sandboxInitPromise = null;
+        toast('运行环境初始化失败：' + (e && e.message ? e.message : e) + '，可稍后重试', 'error', 5000);
+        throw e;
+      }
       if (res && res.initialized === false) {
         const err = res.error || '未知错误';
         hideBootProgress();
@@ -410,6 +514,37 @@ async function ensureSandbox() {
         }
         throw new Error('Termux 初始化失败');
       }
+      // 用户一输入就装好 OpenClaw，不必等打开终端再解压
+      let ocTip = null;
+      try {
+        if (typeof sb.agentStatus === 'function') {
+          const st = await sb.agentStatus();
+          if (!st || !st.installed) {
+            showBootProgress('正在安装 OpenClaw 运行时…');
+            ocTip = document.createElement('div');
+            ocTip.className = 'oc-install-tip';
+            ocTip.textContent = '正在安装 OpenClaw 运行时… 0%';
+            document.body.appendChild(ocTip);
+            window.__ocInstallTip = ocTip;
+            if (typeof sb.agentInit === 'function') await sb.agentInit();
+          }
+          // 无论是否刚装完都重写一次配置：旧版写入过 schema 不接受的键（timezone），
+          // 必须覆盖成合法 JSON，否则 OpenClaw 每次启动都报 config is invalid
+          if (typeof sb.agentConfigure === 'function') {
+            let m2 = '';
+            try { m2 = localStorage.getItem('aichat-agent-model') || ''; } catch (_) {}
+            // 旧版可能把 openclaw:agent 写进缓存，strip 后只剩 "agent"，智谱直接 401
+            if (!/^zhipu:glm-/.test(m2)) {
+              m2 = 'zhipu:glm-4-flash';
+              try { localStorage.setItem('aichat-agent-model', m2); } catch (_) {}
+            }
+            await sb.agentConfigure({ provider: 'zhipu', model: m2 });
+          }
+        }
+      } catch (_) {}
+      hideBootProgress();
+      if (ocTip) { try { ocTip.remove(); } catch (_) {} }
+      window.__ocInstallTip = null;
       sandboxReady = true;
       setTimeout(hideBootProgress, 2000);
       sb.exec({ cmd: 'true', timeout: 5000 }).catch(() => {});
@@ -439,6 +574,35 @@ window.addEventListener('unhandledrejection', (e) => {
 
 // 自建确认框：Capacitor WebView 未实现 WebChromeClient.onJsConfirm，
 // window.confirm 会静默返回 false，所有二次确认必须走这里
+function uiPrompt(message, placeholder = '', okText = '确定', cancelText = '取消') {
+  return new Promise((resolve) => {
+    const mask = document.createElement('div');
+    mask.className = 'ui-confirm-mask';
+    mask.innerHTML = `
+      <div class="ui-confirm-card">
+        <div class="ui-confirm-msg"></div>
+        <textarea class="ui-prompt-input" rows="4"></textarea>
+        <div class="ui-confirm-actions">
+          <button type="button" class="ui-confirm-btn cancel"></button>
+          <button type="button" class="ui-confirm-btn ok"></button>
+        </div>
+      </div>`;
+    mask.querySelector('.ui-confirm-msg').textContent = message;
+    const ta = mask.querySelector('.ui-prompt-input');
+    ta.placeholder = placeholder;
+    const cancelBtn = mask.querySelector('.ui-confirm-btn.cancel');
+    const okBtn = mask.querySelector('.ui-confirm-btn.ok');
+    cancelBtn.textContent = cancelText;
+    okBtn.textContent = okText;
+    const done = (v) => { mask.remove(); resolve(v); };
+    cancelBtn.onclick = () => done(null);
+    okBtn.onclick = () => done(ta.value.trim() || null);
+    mask.addEventListener('click', (e) => { if (e.target === mask) done(null); });
+    document.body.appendChild(mask);
+    setTimeout(() => ta.focus(), 50);
+  });
+}
+
 function uiConfirm(message, okText = '确定', cancelText = '取消') {
   return new Promise((resolve) => {
     const mask = document.createElement('div');
@@ -490,22 +654,60 @@ function createTermPanel(bubble, title, cwd = '') {
   const trim = () => {
     while (body.childNodes.length > MAX_LINES) body.removeChild(body.firstChild);
   };
+  // apt/dpkg 在 tty 下用 \r 原地刷新进度（(Reading database ... 50%），
+  // 逐行落地会刷成上百条，这里把它当作“活动行”就地更新，观感与 Termux 一致
+  // apt 的进度段都以 "xxx... N%" 形态原地刷新，统一识别为活动行，
+  // 否则 Reading package lists / Building dependency tree 会各刷成一屏
+  const LIVE_PREFIX = /^((Reading database|Reading package lists|Building dependency tree|Reading state information|Building data structures|Processing triggers for)\s*\.\.\.|Progress: |Unpacking |Preparing to unpack )/;
   const term = {
     panel, cwd,
     busy: false,
-    write(text, cls) {
+    _liveEl: null,
+    classify(txt, stream) {
+      const t = txt || '';
+      // dpkg/apt 的 warning 走 stderr，但语义是警告，必须黄色而非红色
+      if (/^(dpkg: warning|dpkg-deb: warning|W:|warning:|Ign:)/i.test(t)) return 'term-warn';
+      if (/^(dpkg: error|dpkg-deb: error|E:|error:|Errors were encountered|Unable to locate|Permission denied)/i.test(t)
+          || /(bad interpreter|command not found|No such file or directory|returned an error code|Aborted|SIGSYS|Bad system call)/i.test(t)) return 'term-err';
+      if (/^(Get:|Fetched|Selecting previously|Unpacking|Setting up|Preparing to unpack|Processing triggers|Configuring|Building|Creating config|Need to get|After this operation)/i.test(t)
+          || /\d+%\)?$/.test(t) || /^Setting up /.test(t)) return 'term-ok';
+      if (stream === 'stderr') return 'term-err';
+      if (stream === 'system') return 'term-sys';
+      return '';
+    },
+    write(text, cls, stream) {
       if (hasSelectionIn(body)) return;
-      const s = document.createElement('span');
-      if (cls) s.className = cls;
-      s.textContent = text;
-      body.appendChild(s);
+      const raw = String(text == null ? '' : text);
+      const parts = raw.split('\n');
+      for (let i = 0; i < parts.length; i++) {
+        const line = parts[i];
+        if (line === '' && i === parts.length - 1) continue;
+        const klass = cls || this.classify(line, stream || 'stdout');
+        if (LIVE_PREFIX.test(line)) {
+          if (!this._liveEl || !body.contains(this._liveEl)) {
+            this._liveEl = document.createElement('div');
+            this._liveEl.className = 'term-ok';
+            body.appendChild(this._liveEl);
+          }
+          this._liveEl.textContent = line;
+          this._liveEl.className = klass || 'term-ok';
+        } else {
+          this._liveEl = null;
+          const d = document.createElement('div');
+          if (klass) d.className = klass;
+          d.textContent = line;
+          body.appendChild(d);
+        }
+      }
       trim();
       panel.scrollTop = panel.scrollHeight;
     },
     line(text, cls) {
       if (hasSelectionIn(body)) return;
+      this._liveEl = null;
       const d = document.createElement('div');
-      if (cls) d.className = cls;
+      const klass = cls || this.classify(text, 'system');
+      if (klass) d.className = klass;
       d.textContent = text;
       body.appendChild(d);
       trim();
@@ -513,7 +715,7 @@ function createTermPanel(bubble, title, cwd = '') {
     },
     cmd(c) { this.line('$ ' + c, 'term-cmd'); },
     pushStream(stream, text) {
-      const cls = stream === 'stderr' ? 'term-err' : (stream === 'system' ? 'term-sys' : '');
+      const cls = stream === 'system' ? 'term-sys' : '';
       // pty（script）输出会带 ANSI 控制序列与 \r，直接写进 DOM 会显示成乱码/残行
       const clean = String(text == null ? '' : text)
         .replace(/\x1b\[[0-9;?]*[ -/]*[@-~]/g, '')
@@ -521,9 +723,15 @@ function createTermPanel(bubble, title, cwd = '') {
         // ESC 可能被桥接层吃掉，只剩 "[0m[01;34m" 这类裸序列，需要兜底剥离
         .replace(/\[\d+(?:;\d+)*m/g, '')
         .replace(/\[[0-9;]*[JKH]/g, '')
+        // readline 的括号粘贴模式标记（ESC 若已丢失会剩成 [?2004h）
+        .replace(/\[?\??2004[hl]/g, '')
+        // 兜底：ESC 全丢后可能残留裸 "[?" 前缀
+        .replace(/\[\?\d*[hl]/g, '')
+        // 其余 C0 控制字节（不含换行与 tab）一律丢弃，否则渲染成方块
+        .replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f]/g, '')
         .replace(/\r/g, '');
       if (!clean) return;
-      this.write(clean, cls);
+      this.write(clean, cls, stream);
       if (/(\[Y\/n\]|\[y\/N\]|Do you want to continue|\u662f\u5426\u7ee7\u7eed)/i.test(clean) && typeof window.__termAskConfirm === 'function') {
         window.__termAskConfirm();
       }
@@ -572,7 +780,19 @@ function createTermPanel(bubble, title, cwd = '') {
 }
 
 // 在沙箱内执行命令并把过程写入终端（命令行由调用方负责显示）
+/** apt/pkg install 前弹确认：返回 false 表示用户取消 */
+async function confirmPkgInstall(cmd) {
+  const m = /\b(?:apt-get|apt|pkg|dpkg)\s+(-[^\s]+\s+)*install\s+(-[^\s]+\s+)*([^\s;&|]+)/i.exec(cmd || '');
+  if (!m) return true;
+  const pkgs = m[3].replace(/\s+/g, ' ').trim();
+  return await uiConfirm('即将安装软件包：' + pkgs + '\n确认执行安装？', '安装', '取消');
+}
+
 async function sandboxRun(term, cmd, opts = {}) {
+  if (!opts.confirmed) {
+    const ok = await confirmPkgInstall(cmd);
+    if (!ok) { term.line('已取消安装', 'term-dim'); return { code: 130, stdout: '' }; }
+  }
   const sb = await ensureSandbox();
   const tickBefore = _streamTick;
   _activeStreamTerm = term;
@@ -758,6 +978,9 @@ class ModelPicker {
   constructor(root, onPick) {
     this.root = root;
     this.onPick = onPick;
+    // 侧边栏内的选择器：打开面板时不能再关抽屉，否则抽屉 transform 收起会把
+    // 作为其子节点、fixed 定位的面板一并带离视口，表现为「点开菜单立刻收回」
+    this.inSidebar = root.id === 'model-picker-side';
     this.view = 'main';                 // main | more | think | length
     this.root.classList.add('model-picker');
     this.root.innerHTML = `
@@ -770,7 +993,28 @@ class ModelPicker {
     this.btn = this.root.querySelector('.mp-btn');
     this.panel = this.root.querySelector('.mp-panel');
     this.btn.addEventListener('click', (e) => { e.stopPropagation(); this.toggle(); });
-    document.addEventListener('click', () => this.close());
+    // 面板内部一律 stopPropagation，外部点击才关闭；select 的原生弹层
+    // 关闭时 target 是 select 本身，仍在 root 内，不会触发关闭
+    document.addEventListener('click', (e) => {
+      if (this.root.contains(e.target)) return;
+      if (e.target.closest && e.target.closest('.mp-agent-row')) return;
+      this.close();
+    });
+    this.panel.addEventListener('change', async (e) => {
+      const sel = e.target.closest('.agent-model-sel');
+      if (!sel) return;
+      e.stopPropagation();
+      try {
+        const sb = await ensureSandbox();
+        await sb.agentConfigure({ provider: 'zhipu', model: sel.value });
+        try { localStorage.setItem('aichat-agent-model', sel.value); } catch (_) {}
+        const label = this.panel.querySelector('.agent-model-label');
+        if (label) label.textContent = '执行模型：' + sel.value.replace(/^zhipu:/, '');
+        toast('Agent 执行模型已切换为 ' + sel.value, 'success', 2200);
+      } catch (err) {
+        toast('切换失败：' + (err && err.message ? err.message : err), 'error', 3000);
+      }
+    });
     this.panel.addEventListener('click', (e) => {
       e.stopPropagation(); // 阻止冒泡到 document 的全局关闭，否则面板内点击会被立即关闭
       // 返回按钮
@@ -808,6 +1052,32 @@ class ModelPicker {
         this.close();
         return;
       }
+      // OpenClaw 行内的模型下拉与设置按钮，不能当成选中模型
+      if (e.target.closest('.agent-model-sel')) { e.stopPropagation(); return; }
+      const resetBtn = e.target.closest('.agent-reset-btn');
+      if (resetBtn) {
+        e.stopPropagation();
+        (async () => {
+          const sb = await ensureSandbox();
+          const ok = await uiConfirm('重置将删除 OpenClaw 运行时、配置与记忆，并重新解压约 600MB。继续？', '重置', '取消');
+          if (!ok) return;
+          try {
+            if (typeof sb.agentReset === 'function') await sb.agentReset();
+            sandboxReady = false; _sandboxInitPromise = null;
+            await ensureSandbox();
+            toast('OpenClaw 已重置并重新安装', 'success', 3000);
+          } catch (err) {
+            toast('重置失败：' + (err && err.message ? err.message : err), 'error', 4000);
+          }
+        })();
+        return;
+      }
+      const cfgBtn = e.target.closest('.agent-cfg-btn');
+      if (cfgBtn) {
+        if (typeof window.__openOcSettings === 'function') window.__openOcSettings();
+        this.close();
+        return;
+      }
       // 完整模型列表项
       const item = e.target.closest('.mp-item');
       if (!item || item.classList.contains('disabled')) return;
@@ -817,7 +1087,7 @@ class ModelPicker {
   }
   toggle() { this.panel.classList.contains('hidden') ? this.open() : this.close(); }
   open() {
-    closeSidebar();
+    if (!this.inSidebar) closeSidebar();
     document.querySelectorAll('.model-picker .mp-panel').forEach(p => { if (p !== this.panel) p.classList.add('hidden'); });
     this.view = 'main';
     this.render();
@@ -871,6 +1141,8 @@ class ModelPicker {
     const { free, paid } = modelList;
     const groups = [];
     const pick = (arr, prefix) => (arr || []).filter(m => typeof m === 'object' && String(m.id).startsWith(prefix));
+    const oc = (free || []).filter(m => typeof m === 'object' && String(m.id) === 'openclaw:agent');
+    if (oc.length) groups.push({ label: '本地 Agent · OpenClaw', items: oc });
     const zhipu = pick(free, 'zhipu:');
     if (zhipu.length) groups.push({ label: '智谱 · GLM', items: zhipu });
     const poixe = pick(free, 'poixe:');
@@ -983,12 +1255,23 @@ class ModelPicker {
     const capsBadges = caps.map(c => `<em class="mp-cap" data-cap="${c}">${CAPS_SHORT[c] || c}</em>`).join('')
       + (kind !== 'chat' ? `<em class="mp-cap mp-kind" data-kind="${kind}">${KIND_SHORT[kind] || kind}</em>` : '');
     const isCurrent = id === currentModel;
-    return `<div class="mp-item${disabled ? ' disabled' : ''}${isCurrent ? ' current' : ''}" data-id="${id}">
+    let savedAgentModel = '';
+    try { savedAgentModel = localStorage.getItem('aichat-agent-model') || ''; } catch (_) {}
+    if (!/^zhipu:glm-/.test(savedAgentModel)) savedAgentModel = 'zhipu:glm-4-flash';
+    const agentRow = id === 'openclaw:agent' ? `<div class="mp-agent-row">
+      <select class="agent-model-sel" title="Agent 执行时使用的模型">${LOCAL_MODELS
+        .filter(x => x.kind === 'chat' && x.enabled !== false && String(x.id).startsWith('zhipu:'))
+        .map(x => `<option value="${x.id}"${x.id === savedAgentModel ? ' selected' : ''}>${x.name}</option>`).join('')}</select>
+      <button type="button" class="agent-cfg-btn agent-reset-btn" title="重置 OpenClaw 运行时">重置</button>
+      <button type="button" class="agent-cfg-btn" title="OpenClaw 设置（模型 / 记忆 / 工作区）">设置</button>
+    </div>` : '';
+    return `<div class="mp-item${disabled ? ' disabled' : ''}${isCurrent ? ' current' : ''}${id === 'openclaw:agent' ? ' mp-agent-item' : ''}" data-id="${id}">
       ${modelGlyph(id, 20)}
       <span class="mp-item-name">${modelDisplayName(m)}</span>
       ${capsBadges}
       <span class="mp-item-note">${note}</span>
       ${isCurrent ? '<svg class="icon mp-check" viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="20 6 9 17 4 12"/></svg>' : ''}
+      ${agentRow}
     </div>`;
   }
   refresh() {
@@ -1100,8 +1383,11 @@ async function api(path, opts = {}) {
     const res = await fetch(full, { credentials: 'include', ...opts, headers });
     const data = await res.json().catch(() => ({}));
     if (!res.ok) {
-      if (res.status === 401) setAuth(null);
-      throw new Error(data.error || '请求失败');
+      // 搜索这类旁路请求 401 不应把用户踢下线
+      if (res.status === 401 && !opts.keepAuth) setAuth(null);
+      const err = new Error(data.error || ('HTTP ' + res.status));
+      err.status = res.status;
+      throw err;
     }
     return data;
   } finally {
@@ -1111,22 +1397,23 @@ async function api(path, opts = {}) {
 
 // ========== 登录/注册 ==========
 let authMode = 'login';
-let codeCountdown = null; // 发送验证码倒计时定时器
 function startCodeCountdown(btn, seconds) {
   const orig = btn.dataset.origText || btn.textContent;
   if (!btn.dataset.origText) btn.dataset.origText = orig;
   btn.disabled = true;
-  let left = seconds;
-  btn.textContent = left + 's';
-  clearInterval(codeCountdown);
-  codeCountdown = setInterval(() => {
-    left -= 1;
-    if (left <= 0) {
-      clearInterval(codeCountdown);
+  // 每个按钮独立计时：在注册与邮箱登录之间切换时，互不打断
+  if (btn._codeTimer) clearInterval(btn._codeTimer);
+  btn._codeLeft = seconds;
+  btn.textContent = btn._codeLeft + 's';
+  btn._codeTimer = setInterval(() => {
+    btn._codeLeft -= 1;
+    if (btn._codeLeft <= 0) {
+      clearInterval(btn._codeTimer);
+      btn._codeTimer = null;
       btn.disabled = false;
       btn.textContent = btn.dataset.origText;
     } else {
-      btn.textContent = left + 's';
+      btn.textContent = btn._codeLeft + 's';
     }
   }, 1000);
 }
@@ -1143,8 +1430,16 @@ async function sendMailCode(btn, emailInput, purpose) {
   try {
     const r = await api('/api/send-code', { method: 'POST', body: JSON.stringify({ email, purpose }) });
     if (r.dev) {
-      toast('开发模式：验证码已打印在服务端日志，请查看终端', 'info');
-      console.warn('[dev-code] 服务端日志中的验证码即为本次验证码');
+      // 后端未配置 SMTP：直接回填验证码，避免用户拿不到码以为发送失败
+      if (r.code) {
+        // 注册验证码在 #auth-code，邮箱验证码登录在 #mail-login-code，不能混填
+        const codeInput = document.getElementById(purpose === 'register' ? 'auth-code' : 'mail-login-code');
+        if (codeInput) codeInput.value = String(r.code);
+        toast('验证码已填入（当前环境未配置邮件服务）', 'info');
+      } else {
+        toast('验证码已生成，请查看服务端日志', 'info');
+      }
+      console.warn('[dev-code] 服务端返回开发模式验证码');
     } else {
       toast('验证码已发送至 ' + email + '，请查收邮箱', 'success');
     }
@@ -1230,7 +1525,7 @@ $('auth-password2').addEventListener('input', validatePwdField);
 $('btn-send-code').onclick = () => {
   // 发送验证码前先校验邮箱格式
   if (!validateEmailField()) { $('auth-error').textContent = '请先输入正确格式的邮箱再发送验证码'; return; }
-  sendMailCode($('btn-send-code'), $('auth-email'), 'register');
+  sendMailCode($('btn-send-code'), $('auth-email'), authMode === 'login' ? 'login' : 'register');
 };
 $('btn-send-login-code').onclick = () => sendMailCode($('btn-send-login-code'), $('mail-login-email'), 'login');
 
@@ -1292,6 +1587,8 @@ function saveAuthFromUser(user) {
 // ========== 登录后初始化 ==========
 async function afterLogin(user) {
   currentUser = user;
+  // currentUser 变化后刷新浮动终端入口（未登录/游客不显示）
+  try { window.dispatchEvent(new Event('aichat:auth-changed')); } catch (_) {}
   const isGuest = !!user.guest;               // 游客 / 本地模式
   const isLocal = !!user.local;               // 后端不可达时的纯本地模式
   authScreen.classList.add('hidden');
@@ -1308,8 +1605,15 @@ async function afterLogin(user) {
   $('btn-logout').classList.toggle('hidden', isGuest || isLocal);
   $('btn-bind-email').innerHTML = svgIcon(user.email ? 'edit' : 'link', 12) + ' ' + (user.email ? '修改邮箱' : '绑定邮箱');
   await loadModels();
-  // 从本地存储恢复对话历史（三份备份校验）
-  try { if (window.localCore) await window.localCore.verifyAndRestore(); } catch (_) {}
+  // 从本地存储恢复对话历史（三份备份校验）；校验失败要明确告知，不能静默清空
+  try {
+    if (window.localCore) {
+      const vr = await window.localCore.verifyAndRestore();
+      if (vr && vr.ok === false) {
+        toast('本地备份校验失败，已按安全策略重置本地数据', 'error', 5000);
+      }
+    }
+  } catch (_) {}
   await loadConversations();
   await loadNodes();
   renderSkills();
@@ -1676,9 +1980,11 @@ async function openConversation(id) {
   if (conv.model) { currentModel = conv.model; setModel(conv.model); }
   const box = $('messages');
   box.innerHTML = '';
-  (conv.messages || []).forEach(m => {
-    const { wrap, bubble } = addMessage(m.role, m.content);
+  (conv.messages || []).forEach((m, i) => {
+    const { text: mText, attachList } = splitMessageContent(m.content);
+    const { wrap, bubble } = addMessage(m.role, mText, undefined, attachList);
     if (m.role === 'assistant') finalizeAIMessage(wrap, bubble);
+    else attachUserEdit(wrap, bubble, i);
   });
   loadConversations();
 }
@@ -1827,6 +2133,7 @@ function openHtmlPreview(codeText, filename, files) {
   const close = () => {
     ov.classList.remove('show');
     document.body.style.overflow = '';
+    document.removeEventListener('keydown', ov._esc);
     setTimeout(() => { ov.remove(); if (ov._blobUrl) URL.revokeObjectURL(ov._blobUrl); }, 200);
   };
   ov.addEventListener('click', (e) => {
@@ -1932,8 +2239,25 @@ function carveBashBlocks(text) {
   return { text: t, blocks };
 }
 
+// 多模态 content（数组）拆成可渲染文本 + 缩略图附件列表
+function splitMessageContent(content) {
+  if (!Array.isArray(content)) return { text: String(content == null ? '' : content), attachList: undefined };
+  const texts = [];
+  const attachList = [];
+  for (const p of content) {
+    if (!p || typeof p !== 'object') continue;
+    if (p.type === 'text') { const t = String(p.text || ''); if (t) texts.push(t); }
+    else if (p.type === 'image_url') {
+      const url = (p.image_url && p.image_url.url) || '';
+      attachList.push({ type: 'image', name: '图片', data: url, kind: 'history' });
+    } else if (p.type === 'file') attachList.push({ type: 'file', name: '文件', data: '' });
+  }
+  return { text: texts.join('\n'), attachList: attachList.length ? attachList : undefined };
+}
+
 function renderMarkdown(text) {
-  const carved = carveBashBlocks(text);
+  const src = typeof text === 'string' ? text : formatUserContent(text);
+  const carved = carveBashBlocks(src);
   let html = '';
   if (window.marked) {
     try { html = marked.parse(carved.text); } catch (_) {}
@@ -1968,6 +2292,17 @@ function splitThink(buf) {
 }
 // 多模态用户消息（服务端以 JSON 数组存储）→ 可读占位文本
 function formatUserContent(text) {
+  if (Array.isArray(text)) {
+    return text.map(p => {
+      if (!p || typeof p !== 'object') return '';
+      if (p.type === 'text') return String(p.text || '');
+      if (p.type === 'image_url') return '【图片】';
+      if (p.type === 'video_url') return '【视频】';
+      if (p.type === 'input_audio') return '【语音】';
+      if (p.type === 'file') return '【文件】';
+      return '';
+    }).filter(Boolean).join('\n');
+  }
   if (typeof text !== 'string') return String(text || '');
   const t = text.trim();
   if (t.startsWith('[')) {
@@ -1988,6 +2323,45 @@ function formatUserContent(text) {
   }
   return text;
 }
+// 本地消息就地编辑：只改本机记录并重发，不依赖服务端"修改消息"接口
+function attachUserEdit(wrap, bubble, idx) {
+  if (!bubble || bubble.dataset.editBound) return;
+  bubble.dataset.editBound = '1';
+  bubble.classList.add('msg-editable');
+  bubble.addEventListener('click', async (e) => {
+    if (e.target.closest('a') || e.target.closest('img')) return;
+    if (streaming) { toast('正在生成回复，稍后再改', 'info', 1800); return; }
+    const conv = currentConvId ? findConversation(currentConvId) : null;
+    if (!conv || !conv.messages || !conv.messages[idx]) return;
+    const m = conv.messages[idx];
+    if (m.role !== 'user') return;
+    const cur = typeof m.content === 'string'
+      ? m.content
+      : (Array.isArray(m.content)
+          ? m.content.filter(x => x && x.type === 'text').map(x => x.text || '').join(' ')
+          : '');
+    const next = await uiPrompt('修改这条消息（只改本机记录，随后重新生成回复）', cur);
+    if (next == null) return;
+    const trimmed = String(next).trim();
+    if (!trimmed || trimmed === cur) return;
+    conv.messages = conv.messages.slice(0, idx);   // 丢弃该条及之后，按新内容重发
+    try { await persistState(); } catch (_) {}
+    await openConversation(currentConvId);
+    input.value = trimmed;
+    input.style.height = 'auto';
+    sendMessage();
+  });
+}
+
+function bindLastUserEdit() {
+  const conv = currentConvId ? findConversation(currentConvId) : null;
+  if (!conv || !conv.messages) return;
+  const idx = conv.messages.length - 1;
+  const wraps = document.querySelectorAll('#messages .msg.user');
+  const last = wraps[wraps.length - 1];
+  if (last) attachUserEdit(last, last.querySelector('.msg-bubble'), idx);
+}
+
 function addMessage(role, text, msgId, attachList) {
   const box = $('messages');
   const wrap = document.createElement('div');
@@ -2113,10 +2487,9 @@ function finalizeAIMessage(wrap, bubble) {
   });
   body.appendChild(bar);
 
-  // 自动执行：渲染阶段已把 /--auto-bash--/ 块转成 .code-autobash，这里按块逐个执行
-  if (IS_NATIVE && autoExec && !bubble.dataset.markerExecDone) {
-    const textEl = bubble.querySelector('.msg-text');
-    const blocks = textEl ? Array.from(textEl.querySelectorAll('.code-autobash')) : [];
+  // 自动执行：仅本次新回复生效（历史对话重放不执行），且必须等沙箱真正就绪
+  if (IS_NATIVE && autoExec && bubble.dataset.autoExec === '1' && !bubble.dataset.markerExecDone) {
+    const blocks = Array.from(bubble.querySelectorAll('.code-autobash'));
     if (blocks.length) {
       bubble.dataset.markerExecDone = '1';
       blocks.forEach((block) => {
@@ -2133,17 +2506,19 @@ function finalizeAIMessage(wrap, bubble) {
 
         (async () => {
           try {
-            const sb = await getSandbox();
+            // 统一走 ensureSandbox：注册 output 监听、初始化并应用运行配置；避免每个块重复 sb.init()
+            const sb = await ensureSandbox();
             if (!sb) { resultEl.innerHTML = '<span class="ae-err">沙箱不可用</span>'; return; }
-            await sb.init();
             const killBtn = resultEl.querySelector('.kill-cmd-btn');
             if (killBtn) killBtn.onclick = () => {
-              sb.kill && sb.kill();
+              if (sb.kill) sb.kill();
               resultEl.innerHTML = '<span class="ae-err">▶ 已手动停止</span>';
             };
             const r = await sb.exec({ cmd, timeout: 300000 });
             const out = ((r.stdout || '') + (r.stderr || '')).trim();
-            resultEl.innerHTML = '<span class="ae-ok">▶ 执行完成</span>'
+            const code = (r && r.code != null) ? r.code : 0;
+            resultEl.innerHTML = '<span class="' + (code === 0 ? 'ae-ok' : 'ae-err') + '">'
+              + (code === 0 ? '▶ 执行完成' : '▶ 执行失败（退出码 ' + escapeHtml(String(code)) + '）') + '</span>'
               + '<pre class="ae-out">' + escapeHtml(out.slice(0, 3000) || '（无输出）') + '</pre>';
           } catch (e) {
             resultEl.innerHTML = '<span class="ae-err">▶ 执行失败：' + escapeHtml(e.message || '') + '</span>';
@@ -2184,6 +2559,18 @@ function cycleWebMode() {
 let attachments = []; // { type:'image'|'video'|'file'|'audio', name, data, format, kind }
 function escapeHtml(s) {
   return String(s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+}
+// 残留 ANSI/控制序列兜底剥离：原生 CSI 状态机漏掉的裸片段（ESC 丢失后的 "[90m" 等）不再落到终端
+function stripTermAnsi(s) {
+  return String(s == null ? '' : s)
+    .replace(/\x1b\[[0-9;?]*[ -/]*[@-~]/g, '')
+    .replace(/\x1b\][^\x07\n]*\x07/g, '')
+    .replace(/\[\d+(?:;\d+)*m/g, '')
+    .replace(/\[?\??2004[hl]/g, '')
+    .replace(/\[\?\d*[hl]/g, '')
+    .replace(/\[[0-9;]*[JKH]/g, '')
+    .replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f]/g, '')
+    .replace(/\r/g, '');
 }
 // ============ 附件：按文件类型显示彩色图标 / 照片缩略图 ============
 function fileExtOf(name) {
@@ -2319,8 +2706,16 @@ function readAsAttachment(file, kind) {
       const IMG_MIME = { jpg: 'jpeg', jpeg: 'jpeg', png: 'png', gif: 'gif', webp: 'webp', svg: 'svg+xml', bmp: 'bmp', heic: 'heic', heif: 'heif', avif: 'avif', ico: 'x-icon' };
       data = 'data:image/' + (IMG_MIME[ext] || 'jpeg') + ';base64,' + (data.split(',')[1] || '');
     }
-    attachments[idx] = { type: kind === 'doc' ? 'file' : kind, name: file.name, data, format, kind };
-    renderAttachChips();
+    const commit = (finalData) => {
+      attachments[idx] = { type: kind === 'doc' ? 'file' : kind, name: file.name, data: finalData, format, kind };
+      renderAttachChips();
+    };
+    if (kind === 'image' && typeof data === 'string') {
+      // 统一重编码：透明 PNG/HEIC 在深色气泡里会显示成一整块黑，且超大图会撑爆请求体
+      normalizeImageData(data, commit);
+    } else {
+      commit(data);
+    }
   };
   reader.onerror = () => {
     attachments.splice(idx, 1);
@@ -2329,6 +2724,29 @@ function readAsAttachment(file, kind) {
   };
   reader.readAsDataURL(file);
 }
+// 图片归一化：铺白底重编码为 jpeg，长边上限 1600；解码失败则保留原 data URL
+function normalizeImageData(dataUrl, cb) {
+  const img = new Image();
+  img.onload = () => {
+    try {
+      const max = 1600;
+      const w = img.naturalWidth || img.width, h = img.naturalHeight || img.height;
+      if (!w || !h) return cb(dataUrl);
+      const sc = Math.min(1, max / Math.max(w, h));
+      const cv = document.createElement('canvas');
+      cv.width = Math.max(1, Math.round(w * sc));
+      cv.height = Math.max(1, Math.round(h * sc));
+      const cx = cv.getContext('2d');
+      cx.fillStyle = '#ffffff';
+      cx.fillRect(0, 0, cv.width, cv.height);
+      cx.drawImage(img, 0, 0, cv.width, cv.height);
+      cb(cv.toDataURL('image/jpeg', 0.85));
+    } catch (_) { cb(dataUrl); }
+  };
+  img.onerror = () => cb(dataUrl);
+  img.src = dataUrl;
+}
+
 function guessUrlKind(url) {
   const m = ((url.split('?')[0].match(/\.(\w+)$/) || [])[1] || '').toLowerCase();
   if (['png', 'jpg', 'jpeg', 'gif', 'webp', 'bmp'].includes(m)) return { type: 'image', format: '' };
@@ -2572,7 +2990,7 @@ function addProjectStepLine(bubble, html) {
   el.appendChild(d);
   return d;
 }
-function renderProjectCard(bubble, files) {
+function renderProjectCard(bubble, files, convIdArg) {
   const sorted = [...files].sort((a, b) => a.path.localeCompare(b.path));  const card = document.createElement('div');
   card.className = 'project-card';
   card.innerHTML = `
@@ -2596,8 +3014,7 @@ function renderProjectCard(bubble, files) {
         </div>`;
       }).join('')}
     </div>`;
-  const convId = currentConvId;
-  card.querySelector('.project-zip-btn').onclick = () => downloadProjectZip('project', sorted);
+  const convId = convIdArg || currentConvId;  card.querySelector('.project-zip-btn').onclick = () => downloadProjectZip('project', sorted);
   card.querySelector('.project-ver-btn').onclick = () => openProjectVersions(card, convId);
   card.querySelectorAll('.project-file-copy').forEach(b => {
     b.onclick = () => {
@@ -2790,15 +3207,18 @@ function stopCameraStream() {
   if (v && v.srcObject) { v.srcObject = null; }
 }
 function setCameraPhase(phase) {
-  // phase: 'live' 预览中 | 'shot' 已拍摄 | 'error'
+  // phase: 'live' 预览 | 'edit' 拍后涂画 | 'error'
   const v = $('camera-video'), p = $('camera-preview'), hint = $('camera-hint');
   const shutter = $('cam-shutter'), retake = $('cam-retake'), use = $('cam-use');
+  const edit = $('camera-edit'), tools = $('camera-tools');
   v.hidden = phase !== 'live';
-  p.hidden = phase !== 'shot';
+  p.hidden = true;                       // 拍完直接进编辑画布，不再单独显示静态预览
   hint.classList.toggle('hidden', phase !== 'error');
   shutter.classList.toggle('hidden', phase !== 'live');
-  retake.classList.toggle('hidden', phase !== 'shot');
-  use.classList.toggle('hidden', phase !== 'shot');
+  retake.classList.toggle('hidden', phase !== 'edit');
+  use.classList.toggle('hidden', phase !== 'edit');
+  if (edit) edit.classList.toggle('hidden', phase !== 'edit');
+  if (tools) tools.classList.toggle('hidden', phase !== 'edit');
 }
 async function openCamera() {
   if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
@@ -2812,10 +3232,18 @@ async function openCamera() {
   setCameraPhase('live');
   try {
     // 优先后置摄像头（拍实物），桌面端自动回退默认摄像头
-    cameraStream = await navigator.mediaDevices.getUserMedia({
-      video: { facingMode: { ideal: 'environment' }, width: { ideal: 1280 }, height: { ideal: 1280 } },
-      audio: false
-    });
+    // 全屏拍照：优先请求设备能给到的最高分辨率，拍讲义/公式才能看清
+    const hi = { facingMode: { ideal: 'environment' }, width: { ideal: 2560 }, height: { ideal: 1440 } };
+    let stream = null;
+    try {
+      stream = await navigator.mediaDevices.getUserMedia({ video: hi, audio: false });
+    } catch (_) {
+      stream = await navigator.mediaDevices.getUserMedia({
+        video: { facingMode: { ideal: 'environment' }, width: { ideal: 1920 }, height: { ideal: 1080 } },
+        audio: false
+      });
+    }
+    cameraStream = stream;
     $('camera-video').srcObject = cameraStream;
     await $('camera-video').play().catch(() => {});
   } catch (err) {
@@ -2836,23 +3264,108 @@ function closeCamera() {
   $('camera-modal').classList.add('hidden');
   capturedDataUrl = '';
 }
+let camImg = null, camStrokes = [], camStroke = null, camColor = '#ef4444';
+
 function takePhoto() {
   const v = $('camera-video');
   const w = v.videoWidth, h = v.videoHeight;
   if (!w || !h) { toast('摄像头尚未就绪，请稍候', 'error'); return; }
   const canvas = $('camera-canvas');
-  // 限制最大宽度 1080，控制体积，加快上传与解析
-  const maxW = 1080;
+  const maxW = 2048;                    // 保留原始细节，只做上限约束
   const scale = Math.min(1, maxW / w);
   canvas.width = Math.round(w * scale);
   canvas.height = Math.round(h * scale);
   canvas.getContext('2d').drawImage(v, 0, 0, canvas.width, canvas.height);
-  capturedDataUrl = canvas.toDataURL('image/jpeg', 0.82);
-  const p = $('camera-preview');
-  p.src = capturedDataUrl;
-  setCameraPhase('shot');
+  camImg = new Image();
+  camImg.onload = () => enterCamEdit();
+  camImg.src = canvas.toDataURL('image/jpeg', 0.92);
 }
+
+function enterCamEdit() {
+  const c = $('camera-edit');
+  c.width = camImg.naturalWidth;
+  c.height = camImg.naturalHeight;
+  camStrokes = []; camStroke = null;
+  drawCamEdit();
+  setCameraPhase('edit');
+}
+
+function drawCamEdit() {
+  const c = $('camera-edit');
+  if (!c || !camImg) return;
+  const ctx = c.getContext('2d');
+  ctx.clearRect(0, 0, c.width, c.height);
+  ctx.drawImage(camImg, 0, 0, c.width, c.height);
+  ctx.lineCap = 'round';
+  ctx.lineJoin = 'round';
+  for (const st of camStrokes) {
+    if (!st.points.length) continue;
+    ctx.strokeStyle = st.color;
+    ctx.lineWidth = Math.max(2, Math.round(c.width / 320));
+    ctx.beginPath();
+    ctx.moveTo(st.points[0][0], st.points[0][1]);
+    for (const pt of st.points.slice(1)) ctx.lineTo(pt[0], pt[1]);
+    ctx.stroke();
+  }
+  if (camStroke && camStroke.points.length) {
+    ctx.strokeStyle = camStroke.color;
+    ctx.lineWidth = Math.max(2, Math.round(c.width / 320));
+    ctx.beginPath();
+    ctx.moveTo(camStroke.points[0][0], camStroke.points[0][1]);
+    for (const pt of camStroke.points.slice(1)) ctx.lineTo(pt[0], pt[1]);
+    ctx.stroke();
+  }
+}
+
+function camPoint(e) {
+  const c = $('camera-edit');
+  const r = c.getBoundingClientRect();
+  const x = (e.clientX - r.left) * (c.width / r.width);
+  const y = (e.clientY - r.top) * (c.height / r.height);
+  return [Math.max(0, Math.min(c.width, x)), Math.max(0, Math.min(c.height, y))];
+}
+
+function bindCamEditor() {
+  const c = $('camera-edit');
+  if (!c || c.dataset.bound) return;
+  c.dataset.bound = '1';
+  c.addEventListener('pointerdown', (e) => {
+    if (c.classList.contains('hidden')) return;
+    e.preventDefault();
+    camStroke = { color: camColor, points: [camPoint(e)] };
+    drawCamEdit();
+  });
+  c.addEventListener('pointermove', (e) => {
+    if (!camStroke) return;
+    e.preventDefault();
+    camStroke.points.push(camPoint(e));
+    drawCamEdit();
+  });
+  const end = () => {
+    if (camStroke && camStroke.points.length > 1) camStrokes.push(camStroke);
+    camStroke = null;
+    drawCamEdit();
+  };
+  c.addEventListener('pointerup', end);
+  c.addEventListener('pointercancel', end);
+  c.addEventListener('pointerleave', end);
+  document.querySelectorAll('.cam-color').forEach(btn => {
+    btn.addEventListener('click', () => {
+      camColor = btn.dataset.color || '#ef4444';
+      document.querySelectorAll('.cam-color').forEach(b => b.classList.toggle('active', b === btn));
+    });
+  });
+  const undo = document.getElementById('cam-undo');
+  const clear = document.getElementById('cam-clear');
+  if (undo) undo.addEventListener('click', () => { camStrokes.pop(); drawCamEdit(); });
+  if (clear) clear.addEventListener('click', () => { camStrokes = []; camStroke = null; drawCamEdit(); });
+}
+bindCamEditor();
 function usePhoto() {
+  const edit = $('camera-edit');
+  if (edit && camImg && !edit.classList.contains('hidden')) {
+    try { capturedDataUrl = edit.toDataURL('image/jpeg', 0.92); } catch (_) {}
+  }
   if (!capturedDataUrl) return;
   const d = new Date();
   const pad = (n) => String(n).padStart(2, '0');
@@ -2863,6 +3376,10 @@ function usePhoto() {
   toast('照片已添加，可直接发送或继续添加', 'success', 1800);
 }
 $('cam-cancel').addEventListener('click', closeCamera);
+document.getElementById('cam-retake') && document.getElementById('cam-retake').addEventListener('click', () => {
+  camImg = null; camStrokes = []; camStroke = null; capturedDataUrl = '';
+  setCameraPhase('live');
+});
 $('cam-shutter').addEventListener('click', takePhoto);
 $('cam-retake').addEventListener('click', () => { capturedDataUrl = ''; setCameraPhase('live'); });
 $('cam-use').addEventListener('click', usePhoto);
@@ -2915,8 +3432,23 @@ try {
 const input = $('input');
 const btnSend = $('btn-send');
 const btnStop = $('btn-stop-gen');
-if (btnStop) btnStop.onclick = () => {
+if (btnStop) btnStop.onclick = async () => {
   if (chatAbort) { try { chatAbort.abort(); } catch (_) {} }
+  // Agent 任务跑在原生进程里，必须杀进程才算真正取消
+  if (window.__agentRunning) {
+    try {
+      const sb = getSandbox();
+      if (sb && typeof sb.agentStop === 'function') await sb.agentStop();
+      window.__agentRunning = false;
+      if (window.__agentBubble) {
+        const hint = window.__agentBubble.querySelector('.typing-hint');
+        if (hint) hint.textContent = '已取消';
+        window.__agentBubble.classList.remove('typing');
+      }
+      toast('Agent 任务已取消');
+      return;
+    } catch (_) {}
+  }
   toast('已停止生成');
 };
 // 输入框自动扩展：内容超出后随输入增高（上限 180px，超出出现滚动条）
@@ -2936,6 +3468,51 @@ async function sendMessage() {
   const hasAttach = attachments.length > 0;
   if ((!text && !hasAttach) || streaming) return;
   const kind = modelKind(currentModel);
+  // OpenClaw 本地执行：直接把任务交给内置 Agent，结果回填到对话
+  if (kind === 'agent') {
+    input.value = '';
+    input.style.height = 'auto';
+    hideWelcome();
+    addMessage('user', text);
+    clearAttachments();
+    const { wrap, bubble } = addMessage('assistant', '');
+    bubble.classList.add('typing');
+    bubble.innerHTML = '<span class="typing-dots"><i></i><i></i><i></i></span><span class="typing-hint">OpenClaw 启动中…</span>';
+    window.__agentBubble = bubble;
+    window.__agentRunning = true;
+    // 详细日志区：折叠展示，点开可看 OpenClaw 全部原生日志
+    const logWrap = document.createElement('details');
+    logWrap.className = 'agent-log-wrap';
+    logWrap.innerHTML = '<summary>OpenClaw 运行日志</summary><div class="agent-log-box"></div>';
+    bubble.parentNode.appendChild(logWrap);
+    window.__agentLogBox = logWrap.querySelector('.agent-log-box');
+    try {
+      // 锁定本次任务所属对话，避免用户在 Agent 运行期间切换会话写错地方
+      const convId = currentConvId || nextConvId();
+      if (!currentConvId) currentConvId = convId;
+      ensureConversation(convId, currentModel);
+      appendConvMessage(convId, { role: 'user', content: text });
+      try { bindLastUserEdit(); } catch (_) {}
+      const r = await (window.__runAgentTask ? window.__runAgentTask(text, currentModel) : Promise.resolve(null));
+      const out = (r && r.text) ? r.text : ('Agent 执行结束（退出码 ' + (r && r.code != null ? r.code : '?') + '）');
+      window.__agentBubble = null;
+      window.__agentRunning = false;
+      window.__agentLogBox = null;
+      bubble.classList.remove('typing');
+      bubble.textContent = out;
+      appendConvMessage(convId, { role: 'assistant', content: out });
+      try { await persistState(); } catch (_) {}
+      loadConversations();
+      finalizeAIMessage(wrap, bubble);
+    } catch (e) {
+      window.__agentBubble = null;
+      window.__agentRunning = false;
+      window.__agentLogBox = null;
+      bubble.classList.remove('typing');
+      bubble.textContent = 'Agent 执行失败：' + (e && e.message ? e.message : e);
+    }
+    return;
+  }
   // 生成类模型（绘图/视频/配音）：不需要附件，走专门的生成接口
   if (kind !== 'chat') {
     if (!text) return;
@@ -2992,15 +3569,27 @@ function promptDeactivated(detail) {
 }
 
 async function doChat(text, isRetry = false, opts = {}) {
+  // 图片/多模态消息的 content 是 OpenAI content 数组，historical 版本这里直接 text.replace
+  // 会抛 "text.replace is not a function"，导致图片一发就报错
+  const textStr = Array.isArray(text)
+    ? (text.filter(p => p && p.type === 'text').map(p => String(p.text || '')).join(' ').trim() || '【图片】')
+    : (text && typeof text === 'object')
+      ? String(text.text || text.content || '')
+      : String(text == null ? '' : text);
   const isProject = opts.project === true;
   if (deactivating) { promptDeactivated(); return; }
+  // 先锁定本次请求所属的对话：串流期间用户切到其它对话时，结果仍写回原对话
+  const isNewConv = !currentConvId;
+  const convId = currentConvId || nextConvId();
+  if (!currentConvId) currentConvId = convId;
   streaming = true;
   btnSend.disabled = true;
   if (btnStop) btnStop.classList.remove('hidden');
   chatAbort = new AbortController();
   const chatSeq = (window.__chatSeq = (window.__chatSeq || 0) + 1);
   const { wrap: aiWrap, bubble: aiBubble } = addMessage('assistant', '');
-  aiBubble.classList.add('typing');
+  // 只允许“本次新回复”触发自动执行；历史消息重放绝不执行命令
+  aiBubble.dataset.autoExec = (!isProject && IS_NATIVE) ? '1' : '0';
   aiBubble.classList.add('typing');
   aiBubble.innerHTML = '<span class="typing-dots" aria-label="正在思考"><i></i><i></i><i></i></span>'
     + (opts.hasImage ? '<span class="typing-hint">正在上传 / 解析图片…</span>' : '');
@@ -3142,11 +3731,8 @@ async function doChat(text, isRetry = false, opts = {}) {
     if (!dataStr) return;
     let data; try { data = JSON.parse(dataStr); } catch { return; }
     if (event === 'start') {
-      if (!currentConvId && data.conversation_id) {
-        currentConvId = data.conversation_id;
-        $('chat-title').textContent = data.title;
-        loadConversations();
-      }
+      // 对话 ID 已在发送时锁定，不再依赖服务端回传
+      if (!isRetry && data.title) $('chat-title').textContent = data.title;
       // 绑定刚发送的用户消息 id，支持"点击即可修改"
       if (data.user_message_id) {
         const lastUser = [...document.querySelectorAll('#messages .msg.user')].pop();
@@ -3154,7 +3740,7 @@ async function doChat(text, isRetry = false, opts = {}) {
       }
     } else if (event === 'title') {
       if (data.title) {
-        if (!data.conversation_id || currentConvId === data.conversation_id) {
+        if (!data.conversation_id || convId === data.conversation_id) {
           $('chat-title').textContent = data.title;
         }
         loadConversations();
@@ -3244,13 +3830,13 @@ async function doChat(text, isRetry = false, opts = {}) {
         const el = aiBubble.querySelector('.project-progress');
         if (el) el.remove();
         if (data.files && data.files.length) {
-          renderProjectCard(aiBubble, data.files);
+          renderProjectCard(aiBubble, data.files, convId);
           // 保存到使用用户的设备（浏览器 IndexedDB），服务器不落盘
           try {
             const filesMap = {};
             data.files.forEach(f => { filesMap[f.path] = f.content; });
-            idbGetProject(currentConvId).then(rec =>
-              idbSaveProject(currentConvId, filesMap, (rec && rec.versions) || [])
+            idbGetProject(convId).then(rec =>
+              idbSaveProject(convId, filesMap, (rec && rec.versions) || [])
             ).catch(() => {});
           } catch (_) {}
         }
@@ -3287,7 +3873,7 @@ async function doChat(text, isRetry = false, opts = {}) {
       // 项目式编程：收集所有带文件名的代码块，渲染项目卡片（文件树 + 下载 ZIP）
       if (isProject) {
         const pfiles = collectProjectFiles(aiBubble);
-        if (pfiles.length) renderProjectCard(aiBubble, pfiles);
+        if (pfiles.length) renderProjectCard(aiBubble, pfiles, convId);
       }
       // 付费模型消费后仅刷新菜单里的额度显示，不再弹 toast 打扰用户
       if (data.spend && data.spend.cost > 0) refreshSpendDisplay();
@@ -3300,26 +3886,28 @@ async function doChat(text, isRetry = false, opts = {}) {
   try {
     // 禁用期内禁止对话
 
-    // 确保本地对话（新建或复用），并保存当前用户消息（数据只存使用用户设备）
-    const conv = ensureConversation(currentConvId, currentModel);
-    if (!currentConvId) {
-      currentConvId = conv.id;
-      const t0 = text.replace(/\s+/g, ' ').trim().slice(0, 12) || '新对话';
-      setConvTitle(conv.id, t0);
+    // 确保本地对话（新建或复用）；重试时复用上一条用户消息，不重复写入
+    const conv = ensureConversation(convId, currentModel);
+    if (!isRetry) {
+      appendConvMessage(convId, { role: 'user', content: text });
+      try { bindLastUserEdit(); } catch (_) {}
+      dispatch('start', { conversation_id: convId, title: conv.title, user_message_id: 0 });
+    }
+    if (isNewConv && !isRetry) {
+      const t0 = textStr.replace(/\s+/g, ' ').trim().slice(0, 12) || '新对话';
+      setConvTitle(convId, t0);
       $('chat-title').textContent = t0;
     }
-    appendConvMessage(currentConvId, { role: 'user', content: text });
-    dispatch('start', { conversation_id: currentConvId, title: conv.title, user_message_id: 0 });
     loadConversations();
 
     if (isProject) {
       // 项目式编程：重新生成前快照本设备 IndexedDB 工作区为新版本
-      try { await idbSnapshotProject(currentConvId); } catch (_) {}
+      try { await idbSnapshotProject(convId); } catch (_) {}
 
       // 沙箱改为「按需惰性」：AI 不输出 shell 块就完全不初始化；初始化失败也不阻塞项目生成
       let sandbox = null;
       if (IS_NATIVE) {
-        const projectDir = 'projects/' + currentConvId;
+        const projectDir = 'projects/' + convId;
         let projTerm = null;
         sandbox = {
           projectDir,
@@ -3347,6 +3935,7 @@ async function doChat(text, isRetry = false, opts = {}) {
         rawText: text, modelId: currentModel,
         emit: (event, data) => dispatch(event, data),
         sandbox,
+        signal: chatAbort ? chatAbort.signal : undefined,
       });
       window._lastProjectFiles = finalFiles; // 供 HTML 预览内联 CSS/JS 使用
       if (sandbox && sandbox.term) {
@@ -3356,14 +3945,39 @@ async function doChat(text, isRetry = false, opts = {}) {
       // 保存 assistant 汇总消息到本地对话
       const summary = '项目已分步生成完成，共 ' + finalFiles.length + ' 个文件：\n' +
         finalFiles.map(f => '- ' + f.path).join('\n') + '\n\n可点击「下载 ZIP」获取完整代码。';
-      appendConvMessage(currentConvId, { role: 'assistant', content: summary });
+      appendConvMessage(convId, { role: 'assistant', content: summary });
       await persistState();
       loadConversations();
     } else {
       // 普通聊天：直连供应商（智谱/poixe），poixe 失败自动回退智谱
+      // 直连绕过了后端 /api/chat 的检索环节，这里补一次 /api/search，把结果注入 system
+      let searchNote = '';
+      const needSearch = webMode === 'on'
+        || (webMode === 'auto' && NEED_SEARCH_RE.test(textStr));
+      if (needSearch) {
+        try {
+          renderSearchBadge('searching');
+          if (!authToken()) throw new Error('搜索需要登录');
+          const r = await api('/api/search', {
+            method: 'POST',
+            silent: true,
+            keepAuth: true,
+            body: JSON.stringify({ q: textStr.slice(0, 60) }),
+          });
+          const items = (r && r.results) || [];
+          renderSearchBadge('done', items.length, items);
+          if (items.length) {
+            searchNote = '\n\n【联网检索结果（回答时优先采用并标注来源序号）】\n'
+              + items.slice(0, 6).map((it, i) => `[${i + 1}] ${it.title || ''} ${it.url || ''}\n${String(it.snippet || it.content || '').slice(0, 300)}`).join('\n');
+          }
+        } catch (e) {
+          renderSearchBadge('done', 0, []);
+          searchNote = '\n\n【联网检索不可用：' + (e && e.message ? e.message : e) + '】';
+        }
+      }
       const messages = [
-        { role: 'system', content: CHAT_SYSTEM_PROMPT },
-        ...buildLocalHistory(currentConvId),
+        { role: 'system', content: CHAT_SYSTEM_PROMPT + searchNote },
+        ...buildLocalHistory(convId),
       ];
       const full = await localChatStream({
         modelId: currentModel,
@@ -3374,8 +3988,16 @@ async function doChat(text, isRetry = false, opts = {}) {
         onThink: (t) => dispatch('think', { text: t }),
         onVoice: (a) => dispatch('voice', { data: a.data }),
         signal: chatAbort ? chatAbort.signal : undefined,
+        onReset: () => {
+          // 供应商中途失败换源：清掉半截正文/思考，避免两段回答拼接
+          cancelRender();
+          received = ''; contentBuf = ''; thinkingText = '';
+          const tb = aiBubble.querySelector('.think-box');
+          if (tb) tb.remove();
+        },
       });
-      appendConvMessage(currentConvId, { role: 'assistant', content: full });
+      // 落库只存清洗后的正文，不能把 <think> 思考标签写进历史
+      appendConvMessage(convId, { role: 'assistant', content: received || full });
       await persistState();
       dispatch('done', {});
     }
@@ -3432,6 +4054,18 @@ async function doChat(text, isRetry = false, opts = {}) {
     finishChat(chatSeq);
   }
 }
+
+// 外部链接走系统 Chrome 渲染：APP 内置 WebView 内核由系统决定，版本常低于 Chrome，
+// 打开外链会缺 API；这里统一交给外部浏览器处理，保持页面渲染能力与登录态
+document.addEventListener('click', (e) => {
+  const a = e.target.closest && e.target.closest('a[href]');
+  if (!a) return;
+  const href = a.getAttribute('href') || '';
+  if (!/^https?:\/\//i.test(href)) return;
+  if (!IS_NATIVE) return;
+  e.preventDefault();
+  try { window.open(href, '_system'); } catch (_) { window.open(href, '_blank'); }
+}, true);
 
 // 代码块的“执行”按钮：直接投递到终端面板执行
 document.addEventListener('click', (e) => {
@@ -3510,14 +4144,16 @@ async function doGenerate(prompt, kind) {
     }
   };
   try {
-    // 本地对话管理：保存用户 prompt
-    const conv = ensureConversation(currentConvId, currentModel);
-    if (!currentConvId) {
-      currentConvId = conv.id;
+    // 本地对话管理：锁定本次生成所属对话，切会话时结果仍回到原对话
+    const isNewConv = !currentConvId;
+    const convId = currentConvId || nextConvId();
+    if (!currentConvId) currentConvId = convId;
+    ensureConversation(convId, currentModel);
+    if (isNewConv) {
       const t0 = prompt.replace(/\s+/g, ' ').trim().slice(0, 12) || '新对话';
-      setConvTitle(conv.id, t0); $('chat-title').textContent = t0;
+      setConvTitle(convId, t0); $('chat-title').textContent = t0;
     }
-    appendConvMessage(currentConvId, { role: 'user', content: prompt });
+    appendConvMessage(convId, { role: 'user', content: prompt });
     // 生成类（图片/视频/语音）仅智谱支持；若当前选的是 poixe 模型则自动用智谱对应模型
     const apiModel = String(currentModel).startsWith('poixe:')
       ? { image_gen: 'cogview-3-flash', video_gen: 'cogvideox-flash', tts: 'glm-tts' }[kind]
@@ -3527,7 +4163,7 @@ async function doGenerate(prompt, kind) {
       setHint('正在直连智谱生成图片…');
       const url = await zhipuImage(apiModel, prompt);
       renderResult({ type: 'image', url });
-      appendConvMessage(currentConvId, { role: 'assistant', content: '图片：' + url });
+      appendConvMessage(convId, { role: 'assistant', content: '图片：' + url });
     } else if (kind === 'video_gen') {
       setHint('正在提交视频任务…');
       const created = await zhipuVideoCreate(apiModel, prompt);
@@ -3544,7 +4180,7 @@ async function doGenerate(prompt, kind) {
       }
       if (!url) throw new Error('视频生成超时');
       renderResult({ type: 'video', url });
-      appendConvMessage(currentConvId, { role: 'assistant', content: '视频：' + url });
+      appendConvMessage(convId, { role: 'assistant', content: '视频：' + url });
     } else if (kind === 'tts') {
       setHint('正在合成语音…');
       const ab = await zhipuTTS(apiModel, prompt);
@@ -3552,7 +4188,7 @@ async function doGenerate(prompt, kind) {
       const reader64 = new FileReader();
       const b64 = await new Promise((res) => { reader64.onload = () => res(reader64.result.split(',')[1]); reader64.readAsDataURL(blob); });
       renderResult({ type: 'audio', data: b64 });
-      appendConvMessage(currentConvId, { role: 'assistant', content: '语音合成完成' });
+      appendConvMessage(convId, { role: 'assistant', content: '语音合成完成' });
     }
     await persistState();
     loadConversations();
@@ -3628,8 +4264,14 @@ function refreshBanUI() {
 
 // ========== 用户操作 ==========
 $('btn-logout').onclick = async () => {
-  await api('/api/logout', { method: 'POST' });
-  location.reload();
+  try {
+    await api('/api/logout', { method: 'POST' });
+  } catch (_) {
+    // 后端不可达时也允许本地退出，否则按钮会卡住不跳转
+  } finally {
+    setAuth(null);
+    location.reload();
+  }
 };
 $('btn-edit-profile').onclick = () => {
   openAppModal({
@@ -3681,14 +4323,8 @@ $('btn-bind-confirm').onclick = submitBindEmail;
 $('bind-email-input').addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); $('bind-password-input').focus(); } });
 $('bind-password-input').addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); submitBindEmail(); } });
 
-// ========== 消息区事件委托：点击用户消息可修改 + 代码块复制/下载/预览 ==========
+// ========== 消息区事件委托：代码块复制/下载/预览（用户消息编辑由 attachUserEdit 统一处理） ==========
 $('messages').addEventListener('click', (e) => {
-  const userMsg = e.target.closest('.msg.user');
-  if (userMsg && !userMsg.dataset.editing) {
-    userMsg.dataset.editing = '1';
-    startEditUserMessage(userMsg);
-    return;
-  }
   const codeBtn = e.target.closest('.code-actions .code-act');
   if (codeBtn) {
     handleCodeAction(codeBtn);
@@ -3699,7 +4335,8 @@ $('messages').addEventListener('click', (e) => {
 // ========== 启动（v3.27.2：邮箱登录，封禁状态从后端获取） ==========
 (async () => {
   await silentLoad();
-  await persistState().catch(() => {});
+  // 注意：这里不能 persistState。silentLoad 读不出有效数据时是空状态，
+  // 先落盘会把原始备份覆盖成“合法空备份”，随后 verifyAndRestore 再也无法识别/恢复。
   try { reportEvent('app_open', { model: currentModel }); } catch (_) {}
 
   const saved = getAuth();
@@ -3716,8 +4353,8 @@ $('messages').addEventListener('click', (e) => {
       await afterLogin(user);
       return;
     } catch (e) {
-      // token 失效或后端不可达 → 回登录页
-      setAuth(null);
+      // 只有明确的 401 才清登录态；网络不可达不应把用户踢下线并丢失 token
+      if (e && e.status === 401) setAuth(null);
     }
   }
   authScreen.classList.remove('hidden');
@@ -3769,10 +4406,17 @@ pingBackend();
 // ============ 设置面板 ============
 let sandboxMode = 'native';
 let autoExec = true;
+let termFontSize = 13;
 try {
   sandboxMode = localStorage.getItem('aichat-sandbox-mode') || 'native';
   autoExec = localStorage.getItem('aichat-auto-exec') !== '0';
+  const savedFont = Number(localStorage.getItem('aichat-term-font'));
+  if (savedFont >= 11 && savedFont <= 18) termFontSize = savedFont;
 } catch (_) {}
+function applyTermFontSize() {
+  try { document.documentElement.style.setProperty('--term-font-size', termFontSize + 'px'); } catch (_) {}
+}
+applyTermFontSize();
 
 $('btn-settings').onclick = () => {
   $('settings-modal').classList.remove('hidden');
@@ -3780,11 +4424,19 @@ $('btn-settings').onclick = () => {
     r.checked = r.value === sandboxMode;
   });
   $('setting-auto-exec').checked = autoExec;
+  const fontRange = $('setting-term-font');
+  if (fontRange) fontRange.value = String(termFontSize);
 };
 $('settings-close').onclick = () => $('settings-modal').classList.add('hidden');
 $('settings-modal').addEventListener('click', e => {
   if (e.target === $('settings-modal')) $('settings-modal').classList.add('hidden');
 });
+$('setting-term-font').oninput = (e) => {
+  const v = Number(e.target.value);
+  termFontSize = Math.max(11, Math.min(18, v || 13));
+  applyTermFontSize();
+  try { localStorage.setItem('aichat-term-font', String(termFontSize)); } catch (_) {}
+};
 document.querySelectorAll('input[name="sandbox-mode"]').forEach(r => {
   r.onchange = () => {
     sandboxMode = r.value;
@@ -3819,16 +4471,17 @@ async function initFloatingTerminal() {
   const tabsEl = document.getElementById('term-tabs');
 
   // 登录状态判断：未登录时隐藏 FAB
+  // 本地终端是纯本地能力，与登录态无关；此前按 currentUser 判断，
+  // 对话一次后 /api/me 被刷新为 guest/null，按钮就整块消失了
   function refreshFabVisibility() {
-    if (typeof currentUser !== 'undefined' && currentUser && !currentUser.guest) {
-      fab.classList.remove('hidden');
-    } else {
-      fab.classList.add('hidden');
-    }
+    // 终端只在原生端且已登录账号时提供：游客/本地模式/无有效 token 都不暴露入口
+    if (!IS_NATIVE) { fab.classList.add('hidden'); return; }
+    const loggedIn = !!(currentUser && !currentUser.guest && !currentUser.local && authToken());
+    if (!loggedIn) { fab.classList.add('hidden'); return; }
+    fab.classList.remove('hidden');
   }
+  window.addEventListener('aichat:auth-changed', refreshFabVisibility);
   refreshFabVisibility();
-  // 登录/登出后刷新
-  setInterval(refreshFabVisibility, 2000);
 
   // FAB 拖动 + 自动靠边
   let dragging = false, dragMoved = false, startX = 0, startY = 0, origLeft = 0, origTop = 0;
@@ -3879,12 +4532,16 @@ async function initFloatingTerminal() {
   // 命令历史（每个会话独立）
   let histIdx = -1;
 
+  // apt/dpkg 进度段（含下载进度 "45% [9 clang 28.5 MB/30.7 MB 93%]"）
+  const LIVE_LINE = /^((Reading database|Reading package lists|Building dependency tree|Reading state information|Building data structures|Processing triggers for)\s*\.\.\.|Progress: |Unpacking |Preparing to unpack |\d+% \[|\d+% \()/;
+
   function makeSession(idx) {
     const s = {
       id: idx, name: '终端 ' + (idx + 1), cwd: '', busy: false,
       history: [],
       el: document.createElement('div'),
       _curLine: null,
+      _liveEl: null,
       line(text, cls) {
         const d = document.createElement('div');
         if (cls) d.className = cls;
@@ -3895,34 +4552,145 @@ async function initFloatingTerminal() {
         trimSession(this.el);
         if (!hasSelectionIn(this.el)) this.el.scrollTop = this.el.scrollHeight;
       },
-      write(text, cls) {
-        // 按 \n 分割，每行一个 div，正确处理换行
-        const parts = text.split('\n');
+      /** 行级语义分类：警告黄、错误红、apt 动作绿（与 Termux 观感一致） */
+      classify(txt, stream) {
+        const t = txt || '';
+        if (/^(dpkg: warning|dpkg-deb: warning|W:|warning:|Ign:)/i.test(t)) return 'term-warn';
+        if (/^(dpkg: error|dpkg-deb: error|E:|error:|Errors were encountered|Unable to locate)/i.test(t)
+            || /(bad interpreter|command not found|returned an error code|Aborted|Bad system call)/i.test(t)) return 'term-err';
+        if (/^(Get:|Fetched|Selecting previously|Unpacking|Setting up|Preparing to unpack|Processing triggers|Configuring|Building|Creating config|Need to get|After this operation)/i.test(t)
+            || /^\d+% \[/.test(t) || /\d+%\)?$/.test(t)) return 'term-ok';
+        if (stream === 'stderr') return 'term-err';
+        if (stream === 'system') return 'term-sys';
+        return '';
+      },
+      write(text, cls, stream) {
+        const raw = String(text == null ? '' : text);
+        const parts = raw.split('\n');
         parts.forEach((part, i) => {
           if (i > 0) this._curLine = null;
+          if (!part) return;
+          // apt 的进度段用 \r 原地刷新（Reading database ... 50% / 45% [9 clang ...]），
+          // 逐条落地会刷满整屏，这里识别为活动行并就地覆盖
+          if (LIVE_LINE.test(part)) {
+            if (!this._liveEl || !this.el.contains(this._liveEl)) {
+              this._liveEl = document.createElement('div');
+              this._liveEl.style.whiteSpace = 'pre-wrap';
+              this._liveEl.className = 'term-ok';
+              this.el.appendChild(this._liveEl);
+            }
+            // 进度行只用一行：整体绿色，末尾百分比再提亮，效果与 Termux 一致
+            const pm = /^(.*?)(\d+%|Done)\s*$/.exec(part);
+            if (pm) {
+              this._liveEl.innerHTML = escapeHtml(pm[1]) +
+                '<span class="term-pct">' + escapeHtml(pm[2]) + '</span>';
+            } else {
+              this._liveEl.textContent = part;
+            }
+            this._liveEl.className = (cls || this.classify(part, stream)) || 'term-ok';
+            this._curLine = this._liveEl;
+            return;
+          }
+          this._liveEl = null;
           if (!this._curLine) {
             this._curLine = document.createElement('div');
             this._curLine.style.whiteSpace = 'pre-wrap';
             this.el.appendChild(this._curLine);
           }
-          if (part) {
-            const span = document.createElement('span');
-            if (cls) span.className = cls;
-            span.textContent = part;
-            this._curLine.appendChild(span);
-          }
+          const span = document.createElement('span');
+          const klass = cls || this.classify(part, stream || 'stdout');
+          if (klass) span.className = klass;
+          span.textContent = part;
+          this._curLine.appendChild(span);
         });
+        trimSession(this.el);
+        if (!hasSelectionIn(this.el)) this.el.scrollTop = this.el.scrollHeight;
+      },
+      /** 按原生 SGR 片段渲染，颜色完全由程序输出决定，不做文本猜测 */
+      renderRunsInto(container, runs) {
+        for (let i = 0; i < runs.length; i++) {
+          const r = runs[i];
+          const span = document.createElement('span');
+          let text;
+          if (typeof r === 'string') {
+            text = stripTermAnsi(r);
+          } else if (r) {
+            if (typeof r.c === 'number' && r.c >= 0) span.className = 'tc-' + r.c;
+            text = stripTermAnsi(r.t || '');
+          } else { text = ''; }
+          span.textContent = text;
+          if (span.textContent) container.appendChild(span);
+        }
+      },
+      /** 活动行（\r 重绘中的那一行）：覆盖同一个 div */
+      progressRuns(runs) {
+        if (!this._liveEl || !this.el.contains(this._liveEl)) {
+          this._liveEl = document.createElement('div');
+          this._liveEl.style.whiteSpace = 'pre-wrap';
+          this.el.appendChild(this._liveEl);
+        }
+        this._liveEl.innerHTML = '';
+        this.renderRunsInto(this._liveEl, runs);
+        this._curLine = this._liveEl;
+        trimSession(this.el);
+        if (!hasSelectionIn(this.el)) this.el.scrollTop = this.el.scrollHeight;
+      },
+      /** fin=true：这一行结束，固化为独立行；fin=false 等同活动行更新 */
+      pushRuns(stream, runs, fin) {
+        if (!fin) { this.progressRuns(runs); return; }
+        if (this._liveEl && this.el.contains(this._liveEl)) {
+          this._liveEl.innerHTML = '';
+          this.renderRunsInto(this._liveEl, runs);
+          this._liveEl = null;
+        } else {
+          const d = document.createElement('div');
+          d.style.whiteSpace = 'pre-wrap';
+          this.renderRunsInto(d, runs);
+          this.el.appendChild(d);
+        }
+        this._curLine = null;
+        trimSession(this.el);
+        if (!hasSelectionIn(this.el)) this.el.scrollTop = this.el.scrollHeight;
+      },
+      /** 原生 progress 通道：同一进度行原地更新，不再逐行落地 */
+      progress(text) {
+        const part = String(text == null ? '' : text).replace(/\r/g, '');
+        if (!part.trim()) return;
+        if (!this._liveEl || !this.el.contains(this._liveEl)) {
+          this._liveEl = document.createElement('div');
+          this._liveEl.style.whiteSpace = 'pre-wrap';
+          this._liveEl.className = 'term-ok';
+          this.el.appendChild(this._liveEl);
+        }
+        const pm = /^(.*?)(\d+%|Done)\s*$/.exec(part);
+        if (pm) {
+          this._liveEl.innerHTML = escapeHtml(pm[1]) +
+            '<span class="term-pct">' + escapeHtml(pm[2]) + '</span>';
+        } else {
+          this._liveEl.className = 'term-ok';
+          this._liveEl.textContent = part;
+        }
+        this._curLine = this._liveEl;
         trimSession(this.el);
         if (!hasSelectionIn(this.el)) this.el.scrollTop = this.el.scrollHeight;
       },
       cmd(c) { this.line('$ ' + c, 'term-cmd'); },
       pushStream(stream, text) {
-        const cls = stream === 'stderr' ? 'term-err' : (stream === 'system' ? 'term-sys' : '');
-        this.write(text, cls);
+        // pty 输出含 ANSI 与 readline 的括号粘贴序列，ESC 被桥接层吃掉后只剩裸 "[?2004h"
+        const clean = String(text == null ? '' : text)
+          .replace(/\x1b\[[0-9;?]*[ -/]*[@-~]/g, '')
+          .replace(/\x1b\][^\x07\n]*\x07/g, '')
+          .replace(/\[\d+(?:;\d+)*m/g, '')
+          .replace(/\[?\??2004[hl]/g, '')
+          .replace(/\[\?\d*[hl]/g, '')
+          .replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f]/g, '')
+          .replace(/\r/g, '');
+        if (!clean) return;
+        this.write(clean, '', stream);
       },
     };
     s.el.className = 'term-session';
-    s.line('Termux 终端已就绪，输入命令开始使用', 'term-sys');
+    s.line('Termux 终端已就绪 v' + (window.__APP_VER || '?') + '，输入命令开始使用', 'term-sys');
     return s;
   }
 
@@ -3955,7 +4723,9 @@ async function initFloatingTerminal() {
   }
 
   function switchSession(i) {
-    if (activeIdx >= 0 && sessions[activeIdx]) body.removeChild(sessions[activeIdx].el);
+    if (activeIdx >= 0 && sessions[activeIdx] && sessions[activeIdx].el.parentNode === body) {
+      body.removeChild(sessions[activeIdx].el);
+    }
     activeIdx = i;
     body.appendChild(sessions[i].el);
     renderTabs();
@@ -3965,7 +4735,8 @@ async function initFloatingTerminal() {
   function closeSession(i) {
     const s = sessions[i];
     if (s.busy) { s.line('命令正在执行，无法关闭', 'term-err'); return; }
-    body.removeChild(s.el);
+    // 只有当前活动会话的 DOM 挂在 body 上；关闭后台标签页时不能 removeChild
+    if (s.el.parentNode === body) body.removeChild(s.el);
     sessions.splice(i, 1);
     if (sessions.length === 0) {
       closeModal();
@@ -3973,7 +4744,7 @@ async function initFloatingTerminal() {
     }
     if (activeIdx >= sessions.length) activeIdx = sessions.length - 1;
     else if (activeIdx > i) activeIdx--;
-    body.appendChild(sessions[activeIdx].el);
+    if (sessions[activeIdx].el.parentNode !== body) body.appendChild(sessions[activeIdx].el);
     renderTabs();
   }
 
@@ -3987,6 +4758,14 @@ async function initFloatingTerminal() {
     window.__termAnyBusy = running;
   }
   async function stopAllCommands(silent) {
+    // 屏幕模式下命令跑在持久 pty 里，SIGINT 只能靠写 ^C
+    if (screenStarted && termRenderMode() === 'screen') {
+      await sendScreen('\x03');
+      sessions.forEach(s => { s.busy = false; });
+      updateStopBar();
+      if (!silent) toast('已发送 Ctrl+C', 'info', 2000);
+      return true;
+    }
     const running = sessions.filter(s => s.busy);
     if (!running.length) return false;
     try {
@@ -4011,16 +4790,16 @@ async function initFloatingTerminal() {
     if (indexSynced()) return;
     _indexAskPending = true;
     try {
-      const ok = await uiConfirm('是否立即同步软件源索引（apt-get update）？同步后才能安装软件包。', '立即同步', '稍后');
+      const ok = await uiConfirm('是否立即同步软件源索引（apt update）？同步后才能安装软件包。', '立即同步', '稍后');
       if (!ok) {
         markIndexSynced();
-        session.line('已跳过索引同步，可随时手动执行 apt-get update', 'term-sys');
+        session.line('已跳过索引同步，可随时手动执行 apt update', 'term-sys');
         return;
       }
       session.line('正在同步软件源索引…', 'term-sys');
       session.busy = true; updateStopBar();
       try {
-        await sandboxRun(session, 'apt-get update', { cwd: session.cwd || '', timeout: 300000 });
+        await sandboxRun(session, 'apt update', { cwd: session.cwd || '', timeout: 300000 });
         markIndexSynced();
       } finally {
         session.busy = false; updateStopBar();
@@ -4046,11 +4825,322 @@ async function initFloatingTerminal() {
     return s;
   }
 
+  // ============ Termux 屏幕模式：terminal-emulator 的 VT 屏幕在 WebView 里渲染 ============
+  const RENDER_MODE_KEY = 'aichat-term-render';
+  let screenStarted = false, screenEl = null, screenCursor = null;
+  let screenCols = 80, screenRows = 24;
+  const screenLineH = 18;
+  let screenCharW = 7.8;
+
+  // 屏幕模式（原生 Canvas 网格）在多数机型上无法稳定输入与刷新，已下线：一律列表模式
+  function termRenderMode() { return 'list'; }
+
+  const XTERM_16 = ['#0b0b0d', '#cd3131', '#0dbc79', '#e5e510', '#2472c8', '#bc3fbc', '#11a8cd', '#e5e5e5',
+                    '#666666', '#f14c4c', '#23d18b', '#f5f543', '#3b8eea', '#d670d6', '#29b8db', '#ffffff'];
+  function xtermColor(i) {
+    if (i == null || i < 0) return null;
+    if (i < 16) return XTERM_16[i];
+    if (i < 232) {
+      const n = i - 16, r = Math.floor(n / 36), g = Math.floor((n % 36) / 6), b = n % 6;
+      const lv = [0, 95, 135, 175, 215, 255];
+      return 'rgb(' + lv[r] + ',' + lv[g] + ',' + lv[b] + ')';
+    }
+    const g = 8 + (i - 232) * 10;
+    return 'rgb(' + g + ',' + g + ',' + g + ')';
+  }
+
+  function measureChar() {
+    try {
+      const probe = document.createElement('span');
+      probe.textContent = 'MMMMMMMMMM';
+      probe.style.cssText = 'position:absolute;visibility:hidden;white-space:pre;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:13px;line-height:18px';
+      document.body.appendChild(probe);
+      const w = probe.getBoundingClientRect().width / 10;
+      probe.remove();
+      if (w > 3) screenCharW = w;
+    } catch (_) {}
+  }
+
+  function ensureScreenEl() {
+    if (screenEl && document.body.contains(screenEl)) return screenEl;
+    screenEl = document.createElement('div');
+    screenEl.id = 'term-screen';
+    screenEl.className = 'term-screen hidden';
+    body.parentNode.insertBefore(screenEl, body.nextSibling);
+    screenCursor = document.createElement('div');
+    screenCursor.className = 'ts-cursor';
+    screenEl.appendChild(screenCursor);
+    measureChar();
+    return screenEl;
+  }
+
+  let lastScreenAt = 0;
+  function renderScreen(ev) {
+    if (!ev) return;
+    lastScreenAt = Date.now();
+    const el = ensureScreenEl();
+    if (ev.cols) screenCols = ev.cols;
+    if (ev.rows) screenRows = ev.rows;
+    if (el.dataset.rows !== String(screenRows)) {
+      el.querySelectorAll('.ts-row').forEach(n => n.remove());
+      for (let r = 0; r < screenRows; r++) {
+        const d = document.createElement('div');
+        d.className = 'ts-row';
+        el.appendChild(d);
+      }
+      el.dataset.rows = String(screenRows);
+    }
+    const rows = el.querySelectorAll('.ts-row');
+    (ev.lines || []).forEach(item => {
+      const row = rows[item.r];
+      if (!row) return;
+      row.textContent = '';
+      (item.runs || []).forEach(run => {
+        const span = document.createElement('span');
+        if (typeof run === 'string') {
+          span.textContent = run;
+        } else if (run) {
+          span.textContent = run.t || '';
+          if (typeof run.fg === 'number' && run.fg >= 0) span.style.color = xtermColor(run.fg);
+          if (typeof run.bg === 'number' && run.bg >= 0) span.style.background = xtermColor(run.bg);
+          if (run.b) span.style.fontWeight = '700';
+        }
+        if (span.textContent) row.appendChild(span);
+      });
+    });
+    if (screenCursor) {
+      screenCursor.style.display = ev.cursorVisible === false ? 'none' : 'block';
+      screenCursor.style.transform = 'translate(' + ((ev.cursorCol || 0) * screenCharW) + 'px,' + ((ev.cursorRow || 0) * screenLineH) + 'px)';
+    }
+  }
+
+  // 事件通道仍以 notifyListeners 为主，轮询只做兜底：某些机型 WebView 事件节流会让屏幕停在首帧
+  let screenPollTimer = null;
+  function startScreenPoll() {
+    if (screenPollTimer) return;
+    screenPollTimer = setInterval(async () => {
+      if (termRenderMode() !== 'screen' || !screenStarted) return;
+      const modal = document.getElementById('term-modal');
+      if (!modal || modal.classList.contains('hidden')) return;
+      try {
+        const sb = await ensureSandbox();
+        if (sb && typeof sb.termScreen === 'function') {
+          const snap = await sb.termScreen({ full: false });
+          if (snap) renderScreen(snap);
+        }
+      } catch (_) {}
+    }, 400);
+  }
+
+  function applyRenderMode() {
+    const el = ensureScreenEl();
+    const mode = termRenderMode();
+    if (mode === 'screen') {
+      el.classList.remove('hidden');
+      body.classList.add('hidden');
+      // 切到屏幕模式时若 pty 未启动或已退出，重新拉起；否则只做一次 resize
+      setTimeout(() => { if (!screenStarted) startScreenShell(); }, 30);
+    } else {
+      el.classList.add('hidden');
+      body.classList.remove('hidden');
+      const act = sessions[activeIdx];
+      if (act && !(act.el.textContent || '').trim()) {
+        act.line('环境已就绪，输入命令开始使用', 'term-ok');
+      }
+    }
+    const btn = document.getElementById('term-render-toggle');
+    if (btn) btn.classList.add('hidden');
+  }
+
+  async function startScreenShell() {
+    if (termRenderMode() !== 'screen') return;
+    let sb;
+    try { sb = await ensureSandbox(); } catch (_) { return; }
+    if (!sb || typeof sb.termShellStart !== 'function') return;
+    const el = ensureScreenEl();
+    measureChar();
+    screenCols = Math.max(40, Math.floor((el.clientWidth || 380) / screenCharW));
+    screenRows = Math.max(14, Math.floor((el.clientHeight || 420) / screenLineH));
+    if (screenStarted) {
+      try { await sb.termResize({ cols: screenCols, rows: screenRows }); } catch (_) {}
+      return;
+    }
+    try {
+      await sb.termShellStart({ cols: screenCols, rows: screenRows });
+      screenStarted = true;
+      startScreenPoll();
+      if (typeof sb.termScreen === 'function') {
+        sb.termScreen().then(renderScreen).catch(() => {});
+      }
+      setTimeout(async () => {
+        const el = ensureScreenEl();
+        if ((el.textContent || '').trim()) return;
+        // 空屏兜底：pty 可能已退出但 screenStarted 还是 true，强制重启一次
+        if (screenStarted && Date.now() - lastScreenAt > 1500) {
+          try { await sb.termShellStop(); } catch (_) {}
+          screenStarted = false;
+          setTimeout(() => startScreenShell(), 120);
+          return;
+        }
+        screenHint('pty 已启动但没有输出：切到「列表模式」可回到逐行输出，请把设备型号反馈给我定位');
+      }, 1800);
+    } catch (e) {
+      screenHint('启动 pty 失败：' + (e && e.message ? e.message : e));
+      toast('终端 pty 启动失败：' + (e && e.message ? e.message : e), 'error', 5000);
+    }
+  }
+
+  function screenHint(msg) {
+    const el = ensureScreenEl();
+    const d = document.createElement('div');
+    d.className = 'ts-hint';
+    d.textContent = msg;
+    el.appendChild(d);
+    el.scrollTop = el.scrollHeight;
+  }
+
+  let idleTimer = null;
+  function idleWatch() {
+    if (idleTimer) clearTimeout(idleTimer);
+    idleTimer = setTimeout(() => {
+      idleTimer = null;
+      const running = sessions.filter(s => s.busy);
+      if (!running.length) return;
+      if (Date.now() - lastScreenAt < 700) { idleWatch(); return; }  // 仍在输出，继续等
+      running.forEach(s => { s.busy = false; });
+      updateStopBar();
+    }, 900);
+  }
+
+  async function sendScreen(data) {
+    try {
+      const sb = await ensureSandbox();
+      if (sb && typeof sb.termInput === 'function') await sb.termInput({ data: String(data) });
+    } catch (_) {}
+  }
+
+  // ---------- OpenClaw Agent 运行时 ----------
+  let agentReady = false;
+
+  async function ensureAgentRuntime() {
+    const sb = await ensureSandbox();
+    if (!sb || typeof sb.agentStatus !== 'function') return false;
+    const st = await sb.agentStatus();
+    if (st && st.installed) { agentReady = true; return true; }
+    const ok = await uiConfirm('首次使用需解压 OpenClaw 运行时（约 600MB，1-2 分钟，占用机身存储）。确认安装？', '安装', '取消');
+    if (!ok) return false;
+    try { localStorage.setItem(RENDER_MODE_KEY, 'list'); } catch (_) {}
+    applyRenderMode();
+    const s = sessions[sessions.length - 1];
+    if (s) s.line('正在安装 OpenClaw 运行时…', 'term-sys');
+    await sb.agentInit();
+    const st2 = await sb.agentStatus();
+    agentReady = !!(st2 && st2.installed);
+    if (s) s.line(agentReady ? 'OpenClaw 运行时已就绪' : '❌ OpenClaw 运行时安装不完整', agentReady ? 'term-ok' : 'term-err');
+    return agentReady;
+  }
+
+  async function configureAgent(model) {
+    const sb = await ensureSandbox();
+    await sb.agentConfigure({ provider: 'zhipu', model: model || 'glm-4-flash' });
+  }
+
+  window.__runAgentTask = (t, m) => runAgentTask(t, m);
+
+  async function runAgentTask(task, model) {
+    const sb = await ensureSandbox();
+    const s = sessions[sessions.length - 1];
+    if (s) { s.line('$ agent: ' + task, 'term-dim'); s.busy = true; updateStopBar(); }
+    try {
+      await configureAgent(model);
+      const r = await sb.agentRun({ message: task, timeout: 240 });
+      if (s) {
+        if (r && r.text) s.line(r.text, 'term-ok');
+        else if (r && r.code !== 0) s.line('agent 退出码 ' + r.code + '（输出见终端上方）', 'term-err');
+        else s.line('agent 完成（无文本回复）', 'term-sys');
+      }
+      return r;
+    } catch (e) {
+      if (s) s.line('agent 执行失败：' + (e && e.message ? e.message : e), 'term-err');
+      return null;
+    } finally {
+      if (s) { s.busy = false; updateStopBar(); }
+    }
+  }
+
+  // ---------- 重装终端：清空 PREFIX 后重新解压 bootstrap ----------
+  let reinstalling = false;
+  async function reinstallTerminal() {
+    if (reinstalling) return;
+    const ok1 = await uiConfirm('重装终端会删除全部已安装的软件包、家目录文件与终端配置，且无法恢复。是否继续？', '继续', '取消');
+    if (!ok1) return;
+    const ok2 = await uiConfirm('再次确认：软件包、projects 目录与家目录文件都会被清空，确定重装？', '确定重装', '取消');
+    if (!ok2) return;
+
+    reinstalling = true;
+    const btn = document.getElementById('term-reinstall');
+    if (btn) { btn.disabled = true; btn.textContent = '重装中…'; }
+    // 重装进度由 emit('output') 推送，只有列表模式的 DOM 能显示
+    try { localStorage.setItem(RENDER_MODE_KEY, 'list'); } catch (_) {}
+    applyRenderMode();
+    screenStarted = false;
+    let s = sessions[sessions.length - 1];
+    if (!s) s = newSession();
+    activeTerm = s;
+    try { s.el.innerHTML = ''; } catch (_) {}
+    s.line('正在重装终端环境（约 1 分钟）…', 'term-sys');
+
+    try {
+      const sb = await ensureSandbox();
+      try { if (sb && typeof sb.termShellStop === 'function') await sb.termShellStop(); } catch (_) {}
+      await sb.termReinstall();
+      try { localStorage.removeItem('aichat-index-synced'); } catch (_) {}
+      // 重装后索引为空，install 会一直 "Unable to locate package"，顺手同步一次
+      s.line('正在同步软件源索引…', 'term-sys');
+      try {
+        await sandboxRun(s, 'apt update', { cwd: s.cwd || '', timeout: 300000 });
+        markIndexSynced();
+      } catch (e2) {
+        s.line('索引同步失败：' + (e2 && e2.message ? e2.message : e2), 'term-err');
+      }
+      // termReinstall 会清空 prefix，OpenClaw 运行时（prefix/opt/openclaw）随之消失；
+      // 必须重置初始化标记，让 ensureSandbox 重新走 init + agentInit
+      sandboxReady = false;
+      _sandboxInitPromise = null;
+      s.line('正在重新安装 OpenClaw 运行时…', 'term-sys');
+      try { await ensureSandbox(); } catch (e3) {
+        s.line('OpenClaw 重装失败：' + (e3 && e3.message ? e3.message : e3), 'term-err');
+      }
+      s.line('重装完成，正在启动 shell', 'term-ok');
+      toast('终端环境已重装', 'success', 3000);
+    } catch (e) {
+      s.line('❌ 重装失败：' + (e && e.message ? e.message : e), 'term-err');
+      toast('重装失败：' + (e && e.message ? e.message : e), 'error', 5000);
+    } finally {
+      reinstalling = false;
+      if (btn) { btn.disabled = false; btn.textContent = '重装'; }
+      try { localStorage.setItem(RENDER_MODE_KEY, 'screen'); } catch (_) {}
+      applyRenderMode();
+      screenStarted = false;
+      setTimeout(() => startScreenShell(), 500);
+    }
+  }
+
   function openModal() {
     modal.classList.remove('hidden');
     modal.classList.add('term-open');
     // 限制选区：终端打开时只有终端内文本可被选中，拖动越过边界不会选到聊天区
     document.body.classList.add('term-select-lock');
+    // 回放 Agent 在终端关闭期间产生的日志
+    try {
+      const buf = window.__agentLogBuf;
+      const cur = sessions[sessions.length - 1] || null;
+      if (buf && buf.length && cur) {
+        cur.line('—— OpenClaw 运行日志 ——', 'term-sys');
+        buf.slice(-200).forEach(l => { if (l) cur.line(l, 'term-dim'); });
+        window.__agentLogBuf = [];
+      }
+    } catch (_) {}
     if (sessions.length === 0) {
       const s = newSession();
       activeTerm = s;
@@ -4070,6 +5160,7 @@ async function initFloatingTerminal() {
         s.line('❌ ' + e.message, 'term-err');
       });
     }
+    applyRenderMode();
     setTimeout(() => input.focus(), 150);
     activeTerm = sessions[activeIdx];
   }
@@ -4085,6 +5176,113 @@ async function initFloatingTerminal() {
     if (target) { try { target.focus(); target.scrollIntoView({ block: 'nearest' }); } catch (_) {} }
   };
 
+  // ---------- OpenClaw 设置（记忆 / 工作区文件 / 原始配置） ----------
+  let ocFilesCache = {};
+  const ocModal = document.getElementById('oc-settings-modal');
+  const ocFileSel = document.getElementById('oc-file-select');
+  const ocFileBody = document.getElementById('oc-file-body');
+  const ocCfgBody = document.getElementById('oc-config-body');
+  function fmtBytes(n) {
+    if (!n) return '0 B';
+    if (n < 1024) return n + ' B';
+    if (n < 1024 * 1024) return (n / 1024).toFixed(1) + ' KB';
+    return (n / 1024 / 1024).toFixed(1) + ' MB';
+  }
+  async function openOcSettings() {
+    const sb = await ensureSandbox();
+    if (!sb || typeof sb.agentSettingsGet !== 'function') { toast('当前版本不支持 OpenClaw 设置', 'error', 3000); return; }
+    try {
+      const r = await sb.agentSettingsGet();
+      $('oc-settings-path').textContent = (r.workspacePath || '') + '\n' + (r.configPath || '');
+      $('oc-mem-size').textContent = fmtBytes(r.memoryBytes || 0);
+      ocFilesCache = r.files || {};
+      const modelSel = document.getElementById('oc-agent-model');
+      if (modelSel) {
+        const models = LOCAL_MODELS.filter(x => x.kind === 'chat' && String(x.id).startsWith('zhipu:'));
+        let cur = '';
+        try { cur = localStorage.getItem('aichat-agent-model') || ''; } catch (_) {}
+        modelSel.innerHTML = models.map(x => `<option value="${x.id.split(':')[1]}">${x.name}</option>`).join('');
+        const curId = cur.split(':')[1] || 'glm-4-flash';
+        modelSel.value = models.some(x => x.id.split(':')[1] === curId) ? curId : 'glm-4-flash';
+        const cfgModel = (String(r.config || '').match(/"model"\s*:\s*"zhipu\/([^"]+)"/) || [])[1];
+        if (cfgModel && models.some(x => x.id.split(':')[1] === cfgModel)) modelSel.value = cfgModel;
+      }
+      ocFileSel.value = 'AGENTS.md';
+      ocFileBody.value = ocFilesCache['AGENTS.md'] || '';
+      ocCfgBody.value = r.config || '';
+      ocModal.classList.remove('hidden');
+    } catch (e) {
+      toast('读取 OpenClaw 设置失败：' + (e && e.message ? e.message : e), 'error', 4000);
+    }
+  }
+  window.__openOcSettings = openOcSettings;
+  const ocQuickBtn = document.getElementById('oc-quick-settings');
+  if (ocQuickBtn) ocQuickBtn.addEventListener('click', (e) => { e.stopPropagation(); openOcSettings(); });
+  const ocSettingsBtn = document.getElementById('term-settings');
+  if (ocSettingsBtn) ocSettingsBtn.addEventListener('click', (e) => { e.stopPropagation(); openOcSettings(); });
+  if (ocFileSel) {
+    ocFileSel.onchange = () => {
+      ocFilesCache[ocFileSel.value] = ocFileBody.value;
+      ocFileBody.value = ocFilesCache[ocFileSel.value] || '';
+    };
+  }
+  if (ocFileBody) ocFileBody.oninput = () => { ocFilesCache[ocFileSel.value] = ocFileBody.value; };
+  if (ocModal) {
+    document.getElementById('oc-settings-cancel').onclick = () => ocModal.classList.add('hidden');
+    document.getElementById('oc-settings-save').onclick = async () => {
+      const sb = await ensureSandbox();
+      try {
+        const modelSel = document.getElementById('oc-agent-model');
+        if (modelSel && modelSel.value) {
+          await sb.agentConfigure({ provider: 'zhipu', model: modelSel.value });
+          try { localStorage.setItem('aichat-agent-model', 'zhipu:' + modelSel.value); } catch (_) {}
+        }
+        await sb.agentSettingsSave({ config: ocCfgBody.value, files: ocFilesCache });
+        toast('OpenClaw 设置已保存，下次执行 Agent 生效', 'success', 3000);
+        ocModal.classList.add('hidden');
+      } catch (e) {
+        toast('保存失败：' + (e && e.message ? e.message : e), 'error', 4000);
+      }
+    };
+    document.getElementById('oc-mem-clear').onclick = async () => {
+      const sb = await ensureSandbox();
+      const ok = await uiConfirm('清空 OpenClaw 的长期记忆与向量索引？AI 将忘记此前积累的偏好与事实。', '清空', '取消');
+      if (!ok) return;
+      try {
+        const r = await sb.agentMemoryClear();
+        $('oc-mem-size').textContent = '0 B';
+        toast('已清空 ' + (r && r.removed ? r.removed + ' 项' : '记忆'), 'success', 2500);
+      } catch (e) {
+        toast('清空失败：' + (e && e.message ? e.message : e), 'error', 4000);
+      }
+    };
+  }
+
+  const agentBtn = document.getElementById('term-agent');
+  if (agentBtn) agentBtn.onclick = async () => {
+    if (agentBtn.disabled) return;
+    agentBtn.disabled = true;
+    try {
+      const ready = await ensureAgentRuntime();
+      if (!ready) return;
+      const task = await uiPrompt('交给 OpenClaw 执行的任务（在终端内运行，模型请求走后端）', '例如：查看当前目录结构并安装 python');
+      if (!task) return;
+      await runAgentTask(task);
+    } finally { agentBtn.disabled = false; }
+  };
+
+  const reinstallBtn = document.getElementById('term-reinstall');
+  if (reinstallBtn) reinstallBtn.onclick = () => { reinstallTerminal(); };
+
+  const renderToggle = document.getElementById('term-render-toggle');
+  if (renderToggle) {
+    renderToggle.onclick = () => {
+      try { localStorage.setItem(RENDER_MODE_KEY, termRenderMode() === 'screen' ? 'list' : 'screen'); } catch (_) {}
+      applyRenderMode();
+      if (termRenderMode() === 'screen') startScreenShell();
+    };
+  }
+
   // 供消息里的“执行”按钮直接投递到终端
   window.__runInTerminal = async (cmd) => {
     if (!IS_NATIVE) { toast('终端仅在手机端可用', 'error'); return; }
@@ -4092,21 +5290,26 @@ async function initFloatingTerminal() {
     let s = sessions[sessions.length - 1];
     if (!s) s = newSession();
     activeTerm = s;
+    if (termRenderMode() === 'screen') {
+      await startScreenShell();
+      await sendScreen(cmd + '\r');
+      return;
+    }
     s.line('$ ' + cmd, 'term-dim');
+    // openclaw 的 doctor/configure 会画 TUI，pty + ANSI 光标定位在本终端里会退化成逐字符换行，
+    // 用 TERM=dumb 让上游按纯文本流输出
+    let execCmd = cmd;
+    if (/^\s*openclaw\b/.test(execCmd)) execCmd = 'TERM=dumb NO_COLOR=1 ' + execCmd;
     try {
-      await sandboxRun(s, cmd, { cwd: s.cwd || '', timeout: 300000, noAutoYes: true, interactive: true });
+      await sandboxRun(s, execCmd, { cwd: s.cwd || '', timeout: 300000, noAutoYes: true, interactive: true });
     } catch (err) {
       s.line('执行失败：' + err.message, 'term-err');
     }
   };
 
   async function closeModal() {
-    // 有命令在跑时必须先确认：关闭面板会强制结束它们
-    if (sessions.some(s => s.busy)) {
-      const ok = await uiConfirm('当前窗口还有命令正在执行，关闭将结束所有命令。', '结束并关闭', '继续执行');
-      if (!ok) return;
-      stopAllCommands(true);
-    }
+    // 关闭只是收起面板：命令继续在后台执行，结果仍会写回会话；
+    // 需要终止时用命令行内的「停止」或工具栏「重装」
     modal.classList.add('term-closing');
     setTimeout(() => {
       modal.classList.add('hidden');
@@ -4133,6 +5336,13 @@ async function initFloatingTerminal() {
         btn.classList.toggle('active', mods[k]);
         input.focus();
         return;
+      }
+      if (screenStarted && termRenderMode() === 'screen') {
+        const seq = {
+          ESC: '\x1b', TAB: '\t', UP: '\x1b[A', DOWN: '\x1b[B', LEFT: '\x1b[D', RIGHT: '\x1b[C',
+          HOME: '\x1b[H', END: '\x1b[F', PGUP: '\x1b[5~', PGDN: '\x1b[6~',
+        }[k];
+        if (seq) { void sendScreen(seq); input.focus(); return; }
       }
       // 特殊键直接发送到输入框
       const keyMap = {
@@ -4161,6 +5371,41 @@ async function initFloatingTerminal() {
   input.addEventListener('keydown', async (e) => {
     const cur = sessions[activeIdx];
     if (!cur) return;
+
+    // 屏幕模式但 shell 没起来：回车时现场拉起，成功后再补发这一行
+    if (termRenderMode() === 'screen' && !screenStarted && e.key === 'Enter') {
+      e.preventDefault();
+      const pending = input.value;
+      input.value = '';
+      if (!pending) return;
+      screenHint('shell 未启动，正在启动…');
+      await startScreenShell();
+      if (screenStarted) await sendScreen(pending + '\r');
+      else { input.value = pending; screenHint('shell 启动失败：切到「列表模式」可继续用'); }
+      return;
+    }
+
+    // 屏幕模式：pty 自己回显与行编辑，这里只负责把按键/整行送进 shell
+    if (screenStarted && termRenderMode() === 'screen') {
+      if (e.key === 'Enter') {
+        e.preventDefault();
+        const val = input.value;
+        input.value = '';
+        if (val && cur.history) cur.history.push(val);
+        if (val) {
+          cur.busy = true;
+          updateStopBar();
+          lastScreenAt = Date.now();
+          idleWatch();
+        }
+        await sendScreen(val + '\r');
+        return;
+      }
+      const seq = { ArrowUp: '\x1b[A', ArrowDown: '\x1b[B', ArrowLeft: '\x1b[D', ArrowRight: '\x1b[C',
+                    Home: '\x1b[H', End: '\x1b[F', PageUp: '\x1b[5~', PageDown: '\x1b[6~',
+                    Escape: '\x1b', Tab: '\t' }[e.key];
+      if (seq) { e.preventDefault(); await sendScreen(seq); return; }
+    }
 
     // 方向键历史
     if (e.key === 'ArrowUp') {
@@ -4239,9 +5484,165 @@ async function initFloatingTerminal() {
     }
   });
 }
+// ==================== 版本更新：镜像源拉取清单 → 版本比对 → 下载安装 ====================
+const UPDATE_REPO = 'zhaohairuiour/ai-chat-app';
+const UPDATE_BRANCH = 'main';
+// 清单 JSON 经镜像前缀回源，顺序即优先级；末尾直连兜底
+const MANIFEST_MIRRORS = [
+  'https://ghproxy.net/https://raw.githubusercontent.com/' + UPDATE_REPO + '/' + UPDATE_BRANCH + '/version.json',
+  'https://gh-proxy.com/https://raw.githubusercontent.com/' + UPDATE_REPO + '/' + UPDATE_BRANCH + '/version.json',
+  'https://raw.githubusercontent.com/' + UPDATE_REPO + '/' + UPDATE_BRANCH + '/version.json'
+];
+// APK 下载镜像前缀（拼在 Release 下载地址前），空串为直连兜底
+const APK_MIRROR_PREFIXES = ['https://ghproxy.net/', 'https://gh-proxy.com/', ''];
+
+function compareVer(a, b) {
+  const pa = String(a || '').split('.').map(x => parseInt(x, 10) || 0);
+  const pb = String(b || '').split('.').map(x => parseInt(x, 10) || 0);
+  for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
+    const d = (pa[i] || 0) - (pb[i] || 0);
+    if (d) return d;
+  }
+  return 0;
+}
+
+async function fetchTextTimeout(url, ms = 12000) {
+  const ctl = new AbortController();
+  const timer = setTimeout(() => ctl.abort(), ms);
+  try {
+    const r = await fetch(url, { signal: ctl.signal, cache: 'no-store', headers: { 'Cache-Control': 'no-cache' } });
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    return await r.text();
+  } finally { clearTimeout(timer); }
+}
+
+async function fetchUpdateManifest() {
+  let lastErr = null;
+  for (const url of MANIFEST_MIRRORS) {
+    try {
+      const txt = await fetchTextTimeout(url, 12000);
+      const j = JSON.parse(txt);
+      if (j && j.apkUrl) return j;
+    } catch (e) { lastErr = e; }
+  }
+  throw lastErr || new Error('更新清单拉取失败');
+}
+
+let _updateDlg = null;
+
+function showUpdateDialog(manifest, cur) {
+  if (_updateDlg) return;
+  const mask = document.createElement('div');
+  mask.className = 'ui-confirm-mask';
+  mask.innerHTML = `
+    <div class="ui-confirm-card update-card">
+      <div class="update-title">发现新版本 ${escapeHtml(manifest.versionName || '')}</div>
+      <div class="update-ver">当前 ${escapeHtml(cur.name || '?')} → 最新 ${escapeHtml(manifest.versionName || '')}</div>
+      <div class="update-notes">${escapeHtml(manifest.notes || '暂无更新说明')}</div>
+      <div class="update-progress hidden"><div class="update-progress-fill"></div></div>
+      <div class="update-status hidden"></div>
+      <div class="ui-confirm-actions">
+        <button type="button" class="ui-confirm-btn cancel">稍后</button>
+        <button type="button" class="ui-confirm-btn ok">立即更新</button>
+      </div>
+    </div>`;
+  document.body.appendChild(mask);
+  const state = { mask, manifest, busy: false };
+  _updateDlg = state;
+  const okBtn = mask.querySelector('.ok');
+  const cancelBtn = mask.querySelector('.cancel');
+  const bar = mask.querySelector('.update-progress');
+  const fill = mask.querySelector('.update-progress-fill');
+  const status = mask.querySelector('.update-status');
+  const close = () => { mask.remove(); if (_updateDlg === state) _updateDlg = null; };
+  const dismissTag = String(manifest.versionCode || manifest.versionName);
+  cancelBtn.onclick = () => {
+    try { localStorage.setItem('aichat-update-dismissed', dismissTag); } catch (_) {}
+    close();
+  };
+  mask.onclick = (e) => { if (e.target === mask && !state.busy) close(); };
+  okBtn.onclick = () => startUpdate(state, { bar, fill, status, okBtn, cancelBtn, close });
+}
+
+async function downloadUpdateApk(manifest, sb) {
+  if (!sb || typeof sb.downloadApk !== 'function') throw new Error('下载能力不可用');
+  let lastErr = null;
+  for (const p of APK_MIRROR_PREFIXES) {
+    const url = p + manifest.apkUrl;
+    try { return await sb.downloadApk({ url }); }
+    catch (e) { lastErr = e; }
+  }
+  throw lastErr || new Error('所有镜像均下载失败');
+}
+
+async function startUpdate(state, ui) {
+  const { manifest } = state;
+  state.busy = true;
+  ui.okBtn.disabled = true;
+  ui.cancelBtn.disabled = true;
+  ui.bar.classList.remove('hidden');
+  ui.status.classList.remove('hidden');
+  const setPct = (pct, label) => {
+    if (pct >= 0) ui.fill.style.width = pct + '%';
+    if (label != null) ui.status.textContent = label;
+  };
+  const sb = getSandbox();
+  if (sb && typeof sb.addListener === 'function') {
+    try {
+      sb.addListener('update-progress', (ev) => {
+        if (ev && typeof ev.pct === 'number') setPct(ev.pct, ev.pct >= 0 ? '下载中 ' + ev.pct + '%' : '下载中…');
+      });
+    } catch (_) {}
+  }
+  try {
+    setPct(0, '准备下载…');
+    const r = await downloadUpdateApk(manifest, sb);
+    setPct(100, '下载完成，正在拉起安装…');
+    if (sb && typeof sb.installApk === 'function') await sb.installApk({ path: r.path });
+    else throw new Error('当前版本不支持应用内安装');
+  } catch (e) {
+    state.busy = false;
+    ui.okBtn.disabled = false;
+    ui.cancelBtn.disabled = false;
+    ui.status.textContent = '更新失败：' + (e && e.message ? e.message : e);
+    toast('更新失败，请稍后重试', 'error', 4000);
+  }
+}
+
+async function checkAppUpdate(silent) {
+  if (!IS_NATIVE) return;
+  let manifest;
+  try { manifest = await fetchUpdateManifest(); }
+  catch (e) { if (!silent) toast('更新检查失败：' + (e && e.message || e), 'error', 3000); return; }
+  if (!manifest || !manifest.apkUrl) return;
+  let curCode = 0, curName = window.__APP_VER || '0.0.0';
+  const sb = getSandbox();
+  try {
+    if (sb && typeof sb.appInfo === 'function') {
+      const info = await sb.appInfo();
+      if (info) { curCode = Number(info.versionCode) || 0; curName = info.versionName || curName; }
+    }
+  } catch (_) {}
+  const newCode = Number(manifest.versionCode) || 0;
+  const newer = curCode > 0 && newCode > 0 ? newCode > curCode : compareVer(manifest.versionName, curName) > 0;
+  if (!newer) { if (!silent) toast('已是最新版本', 'info', 2000); return; }
+  const tag = String(manifest.versionCode || manifest.versionName);
+  let dismissed = '';
+  try { dismissed = localStorage.getItem('aichat-update-dismissed') || ''; } catch (_) {}
+  if (silent && dismissed === tag) return;
+  showUpdateDialog(manifest, { name: curName, code: curCode });
+}
+
+const btnCheckUpdate = $('btn-check-update');
+if (btnCheckUpdate) btnCheckUpdate.onclick = () => checkAppUpdate(false);
+
 initFloatingTerminal();
 
 // 关闭/刷新页面且仍有命令在执行时提示（WebView 内不弹窗，浏览器端生效）
-window.addEventListener('beforeunload', (e) => {
-  if (window.__termAnyBusy) { e.preventDefault(); e.returnValue = ''; }
+window.addEventListener('beforeunload', () => {
+  // 关闭终端 / 切后台不终止任务：命令继续由原生进程执行，回到页面时结果仍在
+  window.__termAnyBusy = false;
 });
+
+// 启动后延迟静默检查更新；失败/无新版本均不打扰
+setTimeout(() => { checkAppUpdate(true); }, 2500);

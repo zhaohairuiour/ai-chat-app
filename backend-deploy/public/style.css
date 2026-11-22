@@ -2197,7 +2197,7 @@ body {
 .term-tab-close:hover { color: #f85149; }
 
 .term-modal-body { flex: 1; overflow: hidden; position: relative; padding: 0; }
-.term-session { position: absolute; inset: 0; overflow-y: auto; padding: 12px 16px; font-family: 'SF Mono', Menlo, Consolas, monospace; font-size: 13px; line-height: 1.5; color: #c9d1d9; }
+.term-session { position: absolute; inset: 0; overflow-y: auto; padding: 12px 16px; font-family: 'SF Mono', Menlo, Consolas, monospace; font-size: var(--term-font-size, 13px); line-height: 1.5; color: #c9d1d9; }
 .term-session .term-cmd { color: #58a6ff; }
 .term-session .term-err { color: #f85149; }
 .term-session .term-sys { color: #8b949e; }
@@ -2559,19 +2559,23 @@ select, option { background-color: #1c1c20 !important; color: #ececef !important
 /* ==================== v3.34 · 终端运行态控制 ==================== */
 /* 浮动于终端输出区右下角，不占布局行高 */
 .term-stop-row {
-  position: fixed; right: 16px; bottom: 104px;
+  /* 浮动机形式：离边框留出空隙，配合投影产生悬空感，不再贴着终端/输入框边缘 */
+  position: fixed; right: 20px; bottom: 128px;
   display: flex; justify-content: flex-end;
-  padding: 0; background: transparent; z-index: 120;
+  padding: 0 0 0 0; background: transparent; z-index: 120;
   pointer-events: none;
+  margin: 0 4px 8px 0;
 }
 .term-stop-row.hidden { display: none; }
 .term-stop-row .term-stop-btn { pointer-events: auto; }
 .term-stop-btn {
   display: inline-flex; align-items: center; gap: 6px;
-  padding: 7px 16px; border-radius: 999px;
-  background: #2a1518; border: 1px solid #4a2228; color: #ff8f8f;
+  padding: 8px 18px; border-radius: 999px;
+  background: rgba(42,21,24,0.96); border: 1px solid #4a2228; color: #ff8f8f;
   font-size: 12px; font-weight: 500; cursor: pointer;
-  transition: background .15s ease, border-color .15s ease;
+  backdrop-filter: blur(6px);
+  box-shadow: 0 6px 18px rgba(0,0,0,0.5), 0 1px 2px rgba(0,0,0,0.35);
+  transition: background .15s ease, border-color .15s ease, transform .12s ease;
 }
 .term-stop-btn:active { background: #3a1a1e; border-color: #6a2a32; }
 .term-session {
@@ -2606,6 +2610,17 @@ select, option { background-color: #1c1c20 !important; color: #ececef !important
 .ui-confirm-btn.cancel { background: transparent; }
 .ui-confirm-btn.ok { background: #4d6bfe; border-color: #4d6bfe; color: #fff; }
 .ui-confirm-btn:active { opacity: .85; }
+
+/* ==================== 版本更新 ==================== */
+.update-card .update-title { font-size: 15px; font-weight: 600; color: #ececef; margin-bottom: 6px; }
+.update-card .update-ver { font-size: 12px; color: #8b949e; margin-bottom: 10px; }
+.update-card .update-notes {
+  font-size: 13px; color: #c9c9d1; line-height: 1.6; white-space: pre-wrap;
+  word-break: break-word; margin-bottom: 14px; max-height: 180px; overflow-y: auto;
+}
+.update-progress { height: 8px; border-radius: 6px; background: #232329; overflow: hidden; margin-bottom: 6px; }
+.update-progress-fill { height: 100%; width: 0%; background: #4d6bfe; border-radius: 6px; transition: width .2s ease; }
+.update-status { font-size: 12px; color: #8b949e; margin-bottom: 12px; min-height: 16px; }
 
 /* ==================== v3.32.46 · 自动执行块 ==================== */
 .code-autobash { border-color: rgba(46,160,67,.45); }
@@ -2668,3 +2683,176 @@ body.term-select-lock .term-modal .term-input { -webkit-user-select: text; user-
 .mp-panel .mp-search-input { color: #ececf1; }
 .mp-panel .mp-check { color: var(--primary); }
 .mp-panel::-webkit-scrollbar-thumb { background: #33333c; }
+
+/* 终端语义色：警告黄、错误红、apt 进度绿（与 Termux 观感一致） */
+.term-panel .term-warn { color: #fbbf24; }
+.term-panel .term-err  { color: #f87171; }
+.term-panel .term-ok   { color: #34d399; }
+.term-panel .term-sys  { color: #fbbf24; }
+
+/* 进度行：整体绿 + 百分比提亮，模拟 Termux 的进度观感 */
+.term-session .term-pct, .term-panel .term-pct { color: #6ee7b7; font-weight: 600; }
+
+/* 终端 SGR 前景色（对应 30-37），颜色来自程序自身输出，不靠文本猜测 */
+.term-session .tc-0, .term-panel .tc-0 { color: #6b7280; }
+.term-session .tc-1, .term-panel .tc-1 { color: #f87171; }
+.term-session .tc-2, .term-panel .tc-2 { color: #34d399; }
+.term-session .tc-3, .term-panel .tc-3 { color: #fbbf24; }
+.term-session .tc-4, .term-panel .tc-4 { color: #60a5fa; }
+.term-session .tc-5, .term-panel .tc-5 { color: #c084fc; }
+.term-session .tc-6, .term-panel .tc-6 { color: #22d3ee; }
+.term-session .tc-7, .term-panel .tc-7 { color: #e5e7eb; }
+
+/* Termux 屏幕模式：等宽字符网格，颜色来自 terminal-emulator 的 SGR 解析结果 */
+.term-render-toggle {
+  background: #21262d; color: #c9d1d9; border: 1px solid #30363d;
+  padding: 6px 10px; border-radius: 6px; font-size: 12px; cursor: pointer;
+}
+.term-render-toggle:active { background: #30363d; }
+.term-screen {
+  flex: 1 1 auto; position: relative; overflow: auto;
+  background: #0b0b0d; padding: 6px 8px;
+  font-family: ui-monospace, Menlo, Consolas, monospace;
+  font-size: 13px; line-height: 18px;
+}
+.term-screen.hidden { display: none; }
+.ts-row { white-space: pre; height: 18px; overflow: hidden; }
+.ts-cursor {
+  position: absolute; top: 6px; left: 8px; width: 7.6px; height: 18px;
+  background: #34d399; opacity: .45; border-radius: 1px; pointer-events: none;
+  will-change: transform;
+}
+
+/* 屏幕模式诊断提示（空屏时说明原因，避免用户看到纯黑） */
+.ts-hint { color: #fbbf24; font-size: 12px; padding: 6px 2px; white-space: normal; }
+
+/* 重装终端按钮：危险操作，用暗红描边与渲染切换按钮区分 */
+.term-reinstall-btn {
+  background: transparent; color: #f87171; border: 1px solid #7f1d1d;
+  padding: 6px 10px; border-radius: 6px; font-size: 12px; cursor: pointer;
+}
+.term-reinstall-btn:disabled { opacity: .5; cursor: not-allowed; }
+
+/* OpenClaw Agent 入口与任务输入 */
+.term-agent-btn {
+  background: #1f2937; color: #93c5fd; border: 1px solid #334155;
+  padding: 6px 10px; border-radius: 6px; font-size: 12px; cursor: pointer;
+}
+.term-agent-btn:disabled { opacity: .55; cursor: not-allowed; }
+.ui-prompt-input {
+  width: 100%; box-sizing: border-box; margin: 8px 0 4px;
+  background: #0f1115; color: #e5e7eb; border: 1px solid #30363d;
+  border-radius: 6px; padding: 8px; font-size: 13px; resize: vertical;
+}
+
+/* 全屏拍照：预览占满整屏，拍后可涂画标注 */
+.camera-modal { padding: 0; background: #000; backdrop-filter: none; align-items: stretch; }
+.camera-card {
+  max-width: none; width: 100%; height: 100%;
+  border-radius: 0; padding: 0; gap: 0; background: #000;
+  box-shadow: none;
+}
+.camera-view { flex: 1 1 auto; aspect-ratio: auto; border-radius: 0; background: #000; }
+.camera-view video, .camera-view img { object-fit: contain; }
+#camera-edit { position: absolute; inset: 0; width: 100%; height: 100%; touch-action: none; }
+#camera-edit.hidden { display: none; }
+.camera-tools {
+  display: flex; align-items: center; justify-content: center; gap: 8px;
+  padding: 10px 12px; background: #0b0b0d; border-top: 1px solid #1f2229;
+}
+.cam-color, .cam-tool {
+  min-width: 40px; height: 32px; border-radius: 16px; font-size: 12px; cursor: pointer;
+  background: #171a21; color: #d4d4d8; border: 1px solid #2b2f38;
+}
+.cam-color.active { border-color: #4d6bfe; color: #fff; }
+.cam-color[data-color="#ef4444"] { color: #f87171; }
+.cam-color[data-color="#fbbf24"] { color: #fbbf24; }
+.cam-color[data-color="#38bdf8"] { color: #38bdf8; }
+.camera-actions { padding: 12px 16px calc(12px + env(safe-area-inset-bottom)); background: #0b0b0d; }
+
+/* 终端打开时的选区内锁曾把 user-select:none 套到所有元素，WebView 上会让输入框拒绝软键盘 */
+body.term-select-lock #term-modal-input,
+#term-modal-input {
+  -webkit-user-select: text !important;
+  user-select: text !important;
+  pointer-events: auto;
+  -webkit-user-modify: read-write;
+}
+/* 页面级 boot-progress 脱离终端面板，终端打开时不再与 #term-progress 叠成两条动画 */
+#boot-progress {
+  position: fixed; left: 12px; right: 12px; top: calc(env(safe-area-inset-top) + 8px);
+  z-index: 9999; margin: 0;
+}
+
+/* OpenClaw 设置面板 */
+.oc-settings-card { max-height: 86vh; overflow-y: auto; }
+.oc-section { margin: 12px 0; padding: 12px; background: #17171a; border: 1px solid #26262b; border-radius: 12px; }
+.oc-row { display: flex; align-items: center; justify-content: space-between; margin-bottom: 8px; font-size: 13px; color: #d4d4d8; }
+.oc-muted { color: #8b8b93; font-size: 12px; }
+.oc-label { display: block; font-size: 12px; color: #a1a1aa; margin-bottom: 6px; }
+.oc-settings-card select,
+.oc-settings-card textarea {
+  width: 100%; box-sizing: border-box; background: #0f0f12; color: #e6e6ea;
+  border: 1px solid #2b2b31; border-radius: 10px; padding: 8px 10px;
+  font-size: 13px; font-family: ui-monospace, Menlo, Consolas, monospace; outline: none;
+}
+.oc-settings-card textarea { resize: vertical; }
+.oc-actions { display: flex; gap: 10px; justify-content: flex-end; margin-top: 14px; }
+.oc-btn { border: 0; border-radius: 10px; padding: 9px 16px; font-size: 13px; cursor: pointer; }
+.oc-btn.primary { background: #4d6bfe; color: #fff; }
+.oc-btn.ghost { background: #26262b; color: #d4d4d8; }
+.oc-btn.danger { background: #3b1517; color: #f87171; border: 1px solid #7f1d1d; }
+
+/* OpenClaw 行内：执行模型下拉 + 设置 */
+.mp-agent-row { display: flex; align-items: center; gap: 6px; margin-top: 6px; }
+.mp-agent-row select {
+  flex: 1; min-width: 0; background: #0f0f12; color: #d4d4d8;
+  border: 1px solid #2b2b31; border-radius: 8px; padding: 5px 8px;
+  font-size: 12px; outline: none;
+}
+.agent-cfg-btn {
+  flex: none; background: #26262b; color: #d4d4d8; border: 1px solid #33333a;
+  border-radius: 8px; padding: 5px 10px; font-size: 12px; cursor: pointer;
+}
+.agent-cfg-btn:active { background: #33333a; }
+
+/* 输入框旁的 OpenClaw 设置入口 */
+.oc-quick-btn {
+  flex: none; background: #1c1c20; color: #c7c7cf; border: 1px solid #2f2f36;
+  border-radius: 10px; padding: 0 10px; height: 38px; font-size: 12px;
+  cursor: pointer; white-space: nowrap;
+}
+.oc-quick-btn:active { background: #2a2a31; }
+
+/* 对话页内的 OpenClaw 安装进度卡（终端未打开时也可见） */
+.oc-install-tip {
+  position: fixed; left: 12px; right: 12px; bottom: calc(env(safe-area-inset-bottom) + 84px);
+  z-index: 99998; margin: 0 auto; max-width: 560px;
+  background: #17171a; border: 1px solid #2b2b31; border-radius: 12px;
+  padding: 10px 14px; font-size: 13px; color: #d4d4d8;
+  box-shadow: 0 8px 24px rgba(0,0,0,.45);
+}
+.mp-agent-item { flex-wrap: wrap; overflow: visible; }
+.mp-agent-item .mp-agent-row { flex: 1 0 100%; width: 100%; }
+
+/* Agent 执行模型只读标签 */
+.agent-model-label { flex: 1; font-size: 12px; color: #a1a1aa; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+#oc-agent-model { width: 100%; box-sizing: border-box; background: #0f0f12; color: #e6e6ea; border: 1px solid #2b2b31; border-radius: 10px; padding: 8px 10px; font-size: 13px; }
+
+/* OpenClaw 重置按钮 */
+.mp-agent-row .agent-reset-btn {
+  color: #f87171; border-color: #7f1d1d; background: #2a1416;
+}
+.mp-agent-row .agent-reset-btn:active { background: #3b1517; }
+
+/* OpenClaw 详细日志（对话内可展开） */
+.agent-log-wrap { margin: 6px 0 0; font-size: 12px; color: #8b8b93; }
+.agent-log-wrap summary { cursor: pointer; user-select: none; }
+.agent-log-box {
+  max-height: 220px; overflow-y: auto; margin-top: 6px;
+  background: #0f0f12; border: 1px solid #2b2b31; border-radius: 8px;
+  padding: 8px; font-family: ui-monospace, Menlo, Consolas, monospace;
+  font-size: 11px; line-height: 1.5; color: #c7c7cf; white-space: pre-wrap;
+  word-break: break-all;
+}
+.agent-log-box div { margin: 0; }
