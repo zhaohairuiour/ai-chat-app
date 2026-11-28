@@ -56,9 +56,13 @@ function sendMailCode(email, purpose) {
     : purpose === 'login' ? '【AI 助手】登录验证码'
     : '【AI 助手】邮箱绑定验证码';
   const text = `你的 AI 助手验证码是 ${code}，5 分钟内有效。请勿泄露给他人。`;
-  if (process.env.MAIL_DEV === '1' || !MAIL_TRANSPORTER) {
+  if (process.env.MAIL_DEV === '1') {
     console.log(`[MAIL-DEV] 验证码未实际发送。收件人=${email} 验证码=${code}`);
     return Promise.resolve({ dev: true, code });
+  }
+  if (!MAIL_TRANSPORTER) {
+    mailCodes.delete(key);
+    return Promise.reject(new Error('服务端未配置邮件服务（MAIL_USER / MAIL_PASS），请直接使用用户名密码注册/登录'));
   }
   return MAIL_TRANSPORTER.sendMail({
     from: `${'AI 助手'} <${MAIL_USER}>`,
