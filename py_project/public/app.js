@@ -569,6 +569,25 @@ $('am-cancel').onclick = async () => {
 };
 $('app-modal').onclick = (e) => { if (e.target === $('app-modal')) closeAppModal(); };
 
+// ========== 模型元数据工具 ==========
+function findLocalModel(id) {
+  return (typeof LOCAL_MODELS !== 'undefined' && LOCAL_MODELS.find(x => x.id === id)) || null;
+}
+function modelKind(id) {
+  const m = findLocalModel(id);
+  return m && m.kind ? m.kind : 'chat';
+}
+function modelCaps(id) {
+  const m = findLocalModel(id);
+  return m && Array.isArray(m.caps) ? m.caps : [];
+}
+function modelProviderOf(id) {
+  const p = String(id || '').split(':')[0];
+  if (p === 'or') return 'openrouter';
+  if (p === 'poixe' || p === 'zhipu' || p === 'agnes' || p === 'openclaw') return p;
+  return p || 'zhipu';
+}
+
 // ========== 节点（网站内自定义选择器；智谱模型时禁用 poixe 节点） ==========
 let nodes = [];
 class NodePicker {
