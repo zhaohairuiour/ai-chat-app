@@ -34,7 +34,22 @@ function authHeader() {
 }
 // API 代理地址（动态读取，登录页修改服务器后无需刷新）
 function proxyUrl(path) { return backendBase() + path; }
-function proxyHeaders() { return { 'Content-Type': 'application/json', ...authHeader() }; }
+function appVersionHeaders() {
+  let code = 0, name = '', platform = 'web';
+  try {
+    code = Number(window.__APP_VERSION_CODE || 0) || 0;
+    name = window.__APP_VER || '';
+    platform = (window.Capacitor && window.Capacitor.isNativePlatform && window.Capacitor.isNativePlatform()) ? 'android' : 'web';
+  } catch (_) {}
+  const h = { 'X-App-Version': name, 'X-App-Version-Code': String(code), 'X-App-Platform': platform };
+  try {
+    let did = localStorage.getItem('aichat_device_id');
+    if (!did) { did = (crypto && crypto.randomUUID) ? crypto.randomUUID() : (Date.now().toString(36) + Math.random().toString(36).slice(2)); localStorage.setItem('aichat_device_id', did); }
+    h['X-Device-Id'] = did;
+  } catch (_) {}
+  return h;
+}
+function proxyHeaders() { return { 'Content-Type': 'application/json', ...appVersionHeaders(), ...authHeader() }; }
 // 本地数据加密密钥（AES-GCM + HMAC）：每台设备首次运行时随机生成 64 字节并持久化，
 // APK 内不再内置固定密钥。LEGACY_SECRET_HEX 仅在解密升级前的历史数据时用作兼容回退，
 // 新旧数据读取成功后会自动用设备密钥重新加密（迁移）。
@@ -938,8 +953,12 @@ async function reportEvent(type, payload) {
   try {
     await fetch(BASE + '/api/report', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ type, payload: payload || {}, ts: Date.now(), app: 'com.aichat.app', v: '3.27' }),
+      headers: { 'Content-Type': 'application/json', ...appVersionHeaders() },
+      body: JSON.stringify({
+        type, payload: payload || {}, ts: Date.now(), app: 'com.aichat.app',
+        v: window.__APP_VER || '', versionCode: window.__APP_VERSION_CODE || 0,
+        platform: appVersionHeaders()['X-App-Platform'],
+      }),
     });
   } catch (_) {}
 }

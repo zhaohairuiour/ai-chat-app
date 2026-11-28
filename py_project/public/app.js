@@ -312,6 +312,31 @@ const IS_NATIVE = !!(window.Capacitor && typeof window.Capacitor.isNativePlatfor
 let authMode = 'login';
 let quotaCache = null;
 
+function getAppVersionCode() {
+  return Number(window.__APP_VERSION_CODE || 0) || 0;
+}
+function appPlatform() {
+  return IS_NATIVE ? 'android' : 'web';
+}
+function getDeviceId() {
+  try {
+    let id = localStorage.getItem('aichat_device_id');
+    if (!id) {
+      id = (crypto && crypto.randomUUID) ? crypto.randomUUID() : (Date.now().toString(36) + Math.random().toString(36).slice(2));
+      localStorage.setItem('aichat_device_id', id);
+    }
+    return id;
+  } catch (_) { return 'unknown'; }
+}
+function appVersionHeaders() {
+  return {
+    'X-App-Version': window.__APP_VER || '',
+    'X-App-Version-Code': String(getAppVersionCode()),
+    'X-App-Platform': appPlatform(),
+    'X-Device-Id': getDeviceId(),
+  };
+}
+
 function getApiBase() {
   try {
     const stored = (localStorage.getItem('apiBase') || '').trim();
@@ -357,7 +382,7 @@ async function api(path, opts = {}) {
     throw err;
   }
   const url = base + (String(path).startsWith('/') ? path : '/' + path);
-  const headers = { ...(opts.headers || {}) };
+  const headers = { ...appVersionHeaders(), ...(opts.headers || {}) };
   const token = authToken();
   if (token) headers['Authorization'] = 'Bearer ' + token;
   let body = opts.body;
@@ -381,7 +406,9 @@ async function api(path, opts = {}) {
     const err = new Error(msg);
     err.status = res.status;
     err.data = data;
-    if (res.status === 401 && !opts.silent) {
+    if (res.status === 426 && data && data.latest) {
+      showForceUpdate(data.latest);
+    } else if (res.status === 401 && !opts.silent) {
       setAuth(null);
       authScreen.classList.remove('hidden');
       app.classList.add('hidden');
@@ -448,6 +475,48 @@ $('auth-form').onsubmit = async (e) => {
   }
 };
 
+let _forceUpdateShown = false;
+function showForceUpdate(latest) {
+  if (_forceUpdateShown || !latest) return;
+  _forceUpdateShown = true;
+  const mask = document.createElement('div');
+  mask.className = 'ui-confirm-mask';
+  mask.innerHTML = `
+    <div class="ui-confirm-card update-card">
+      <div class="update-title">必须更新到 v${escapeHtml(latest.versionName || '')}</div>
+      <div class="update-ver">后端已拦截当前版本，旧版本无法继续使用</div>
+      <div class="update-notes">${escapeHtml(latest.notes || '请安装最新版本后继续使用。')}</div>
+      <div class="ui-confirm-actions">
+        <a class="ui-confirm-btn ok" href="${escapeHtml(latest.apkUrl || '#')}" target="_blank" rel="noopener">下载完整版</a>
+        ${latest.apkUrlLite ? `<a class="ui-confirm-btn cancel" href="${escapeHtml(latest.apkUrlLite)}" target="_blank" rel="noopener">下载轻量版</a>` : ''}
+      </div>
+    </div>`;
+  document.body.appendChild(mask);
+}
+
+// 最新版启动后主动上报版本号，由后端校验并落库；旧版没有该逻辑，会被 426 拦截
+async function reportAppVersion() {
+  const base = getApiBase();
+  if (!base && !/^http/.test(location.origin)) return;
+  try {
+    const r = await api('/api/app/version/report', {
+      method: 'POST',
+      body: {
+        versionCode: getAppVersionCode(),
+        versionName: window.__APP_VER || '',
+        platform: appPlatform(),
+        deviceId: getDeviceId(),
+      },
+      silent: true,
+    });
+    if (r && r.updateRequired) showForceUpdate(r.latest);
+    return r;
+  } catch (e) {
+    if (e && e.status === 426 && e.data && e.data.latest) showForceUpdate(e.data.latest);
+    throw e;
+  }
+}
+
 async function afterLogin(user) {
   if (!user) return;
   currentUser = user;
@@ -458,6 +527,7 @@ async function afterLogin(user) {
   if ($('user-username')) $('user-username').textContent = user.username ? '@' + user.username : '--';
   if ($('user-email')) $('user-email').textContent = user.email || '未绑定邮箱';
   refreshAuthLine();
+  try { await reportAppVersion(); } catch (_) {}
   await refreshSpendDisplay();
   try { await loadConversations(); } catch (_) {}
 }
@@ -1056,7 +1126,7 @@ function rehighlightCodeBlocks() {
     if (started || window.hljs) return;
     started = true;
     const s = document.createElement('script');
-    s.src = '/vendor/highlight.min.js?v=' + (window.__APP_VER || '3.32.107');
+    s.src = '/vendor/highlight.min.js?v=' + (window.__APP_VER || '3.32.108');
     s.async = true;
     s.dataset.hljs = '1';
     s.onload = () => { try { rehighlightCodeBlocks(); } catch (_) {} };
@@ -3379,7 +3449,8 @@ $('messages').addEventListener('click', (e) => {
   await silentLoad();
   // 注意：这里不能 persistState。silentLoad 读不出有效数据时是空状态，
   // 先落盘会把原始备份覆盖成“合法空备份”，随后 verifyAndRestore 再也无法识别/恢复。
-  try { reportEvent('app_open', { model: currentModel }); } catch (_) {}
+  try { await reportAppVersion(); } catch (_) {}
+  try { reportEvent('app_open', { model: currentModel, platform: appPlatform(), versionCode: getAppVersionCode(), versionName: window.__APP_VER || '' }); } catch (_) {}
 
   const saved = getAuth();
   if (saved && saved.token) {
@@ -4569,6 +4640,11 @@ async function fetchTextTimeout(url, ms = 12000) {
 }
 
 async function fetchUpdateManifest() {
+  // 优先使用后端 /api/app/version（服务端权威版本配置），失败再回退 GitHub raw
+  try {
+    const j = await api('/api/app/version', { silent: true });
+    if (j && j.apkUrl) return j;
+  } catch (_) {}
   let lastErr = null;
   for (const url of MANIFEST_MIRRORS) {
     try {

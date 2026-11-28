@@ -386,6 +386,17 @@ CREATE TABLE IF NOT EXISTS quota_daily (
   updated_at INTEGER NOT NULL,
   PRIMARY KEY (user_id, day)
 );
+CREATE TABLE IF NOT EXISTS app_version_reports (
+  device_id    TEXT PRIMARY KEY,
+  user_id      INTEGER,
+  version_code INTEGER NOT NULL,
+  version_name TEXT,
+  platform     TEXT,
+  ip           TEXT,
+  first_seen   INTEGER NOT NULL,
+  last_seen    INTEGER NOT NULL,
+  reports      INTEGER NOT NULL DEFAULT 1
+);
 CREATE TABLE IF NOT EXISTS messages (
   id              INTEGER PRIMARY KEY AUTOINCREMENT,
   conversation_id INTEGER NOT NULL,
@@ -454,6 +465,29 @@ function getGuestSession() {
   db.prepare('INSERT INTO sessions (token, user_id, expires_at) VALUES (?,?,?)')
     .run(guestToken, guest.id, now() + SESSION_TTL_MS);
   return { token: guestToken, user: { id: guest.id, username: guest.username, nickname: guest.nickname, email: guest.email } };
+}
+
+// ============ 应用版本校验（旧版本强制更新） ============
+// 最新版必须通过 X-App-Version-Code / X-App-Version 请求头上报版本；
+// 缺少版本头或 versionCode < APP_MIN_VERSION_CODE 的客户端，API 返回 HTTP 426。
+const APP_LATEST_VERSION = process.env.APP_LATEST_VERSION || '3.32.108';
+const APP_LATEST_VERSION_CODE = Number(process.env.APP_LATEST_VERSION_CODE || 462);
+const APP_MIN_VERSION_CODE = Number(process.env.APP_MIN_VERSION_CODE || APP_LATEST_VERSION_CODE);
+const APP_UPDATE_NOTES = process.env.APP_UPDATE_NOTES
+  || '新增版本上报与后端校验；旧版本未上报版本号将被强制更新。';
+const APP_RELEASE_BASE = (process.env.APP_RELEASE_BASE
+  || 'https://github.com/zhaohairuiour/ai-chat-app/releases/download').replace(/\/+$/, '');
+function appVersionManifest() {
+  return {
+    versionName: APP_LATEST_VERSION,
+    versionCode: APP_LATEST_VERSION_CODE,
+    minVersionCode: APP_MIN_VERSION_CODE,
+    force: true,
+    notes: APP_UPDATE_NOTES,
+    apkUrl: APP_RELEASE_BASE + '/v' + APP_LATEST_VERSION + '/ai-chat-app-v' + APP_LATEST_VERSION + '-full-nokeys.apk',
+    apkUrlLite: APP_RELEASE_BASE + '/v' + APP_LATEST_VERSION + '/ai-chat-app-v' + APP_LATEST_VERSION + '-lite-nokeys.apk',
+    publishedAt: '2026-11-28',
+  };
 }
 
 // ============ 每日额度（服务端记账，所有模型含免费模型，每日 ¥1） ============
@@ -568,7 +602,7 @@ app.use((req, res, next) => {
   } else {
     res.setHeader('Access-Control-Allow-Origin', '*');
   }
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-App-Version, X-App-Version-Code, X-App-Platform, X-Device-Id');
   res.setHeader('Access-Control-Allow-Methods', 'GET,POST,PUT,DELETE,OPTIONS');
   if (req.method === 'OPTIONS') return res.sendStatus(204);
   next();
@@ -576,7 +610,81 @@ app.use((req, res, next) => {
 app.use(express.json({ limit: '40mb' })); // 多模态附件（图片/文件 base64）需要大请求体，默认 100kb 会 413
 app.use(express.static(path.join(__dirname, 'public')));
 
-// ---- 通用 API 代理（避免 WebView CORS）----
+// ---- 版本上报 / 校验 ----
+const VERSION_EXEMPT = new Set(['/api/app/version', '/api/app/version/report', '/api/report']);
+function normalizeVersionCode(v) {
+  const n = Number(v);
+  return Number.isInteger(n) && n > 0 && n < 1e9 ? n : 0;
+}
+function currentVersionFromReq(req) {
+  return {
+    code: normalizeVersionCode(req.get('x-app-version-code')),
+    name: String(req.get('x-app-version-name') || '').slice(0, 32),
+    platform: String(req.get('x-app-platform') || '').slice(0, 16),
+    deviceId: String(req.get('x-device-id') || '').slice(0, 128),
+  };
+}
+function rejectOldVersion(res, code, latest) {
+  return res.status(426).json({
+    error: code === 'APP_VERSION_REQUIRED'
+      ? '当前客户端未上报版本号，请更新到最新版本'
+      : '当前版本过旧，请更新到最新版本',
+    code,
+    latest,
+    updateUrl: latest.apkUrl,
+    updateUrlLite: latest.apkUrlLite,
+  });
+}
+// 所有 /api/* 请求（除公开版本接口）都必须带版本头；旧 APK 没有该头会被 426 拦截
+app.use('/api', (req, res, next) => {
+  const fullPath = req.baseUrl + req.path;
+  if (VERSION_EXEMPT.has(fullPath)) return next();
+  if (req.method === 'OPTIONS') return next();
+  const v = currentVersionFromReq(req);
+  if (!v.code) return rejectOldVersion(res, 'APP_VERSION_REQUIRED', appVersionManifest());
+  if (v.code < APP_MIN_VERSION_CODE) return rejectOldVersion(res, 'APP_VERSION_TOO_OLD', appVersionManifest());
+  req.appVersion = v;
+  next();
+});
+
+app.get('/api/app/version', (req, res) => {
+  res.json(appVersionManifest());
+});
+
+// 最新版启动/运行时会主动上报版本号，服务端校验并落库（不要求登录）
+app.post('/api/app/version/report', (req, res) => {
+  const code = normalizeVersionCode((req.body && req.body.versionCode) || req.get('x-app-version-code'));
+  const name = String((req.body && req.body.versionName) || req.get('x-app-version-name') || '').slice(0, 32);
+  const platform = String((req.body && req.body.platform) || req.get('x-app-platform') || 'unknown').slice(0, 16);
+  if (!code) return res.status(400).json({ error: 'versionCode 无效' });
+  const deviceId = String((req.body && req.body.deviceId) || req.get('x-device-id') || (req.ip + '|' + req.get('user-agent') || '')).slice(0, 128);
+  const userId = (() => { try { const u = getSessionUser(req); return u ? u.id : null; } catch (_) { return null; } })();
+  const latest = appVersionManifest();
+  const updateRequired = code < APP_MIN_VERSION_CODE;
+  try {
+    const row = db.prepare('SELECT reports FROM app_version_reports WHERE device_id = ?').get(deviceId);
+    if (row) {
+      db.prepare(`UPDATE app_version_reports SET user_id = ?, version_code = ?, version_name = ?, platform = ?, ip = ?, last_seen = ?, reports = reports + 1 WHERE device_id = ?`)
+        .run(userId, code, name, platform, req.ip, now(), deviceId);
+    } else {
+      db.prepare(`INSERT INTO app_version_reports (device_id, user_id, version_code, version_name, platform, ip, first_seen, last_seen, reports)
+        VALUES (?,?,?,?,?,?,?,?,1)`)
+        .run(deviceId, userId, code, name, platform, req.ip, now(), now());
+    }
+  } catch (e) { console.error('[version] 记录失败:', e.message); }
+  console.log('[version] report device=' + deviceId.slice(0, 12) + ' code=' + code + ' name=' + name + ' platform=' + platform + ' updateRequired=' + updateRequired);
+  res.json({ ok: !updateRequired, reported: { versionCode: code, versionName: name, platform }, updateRequired, latest });
+});
+
+
+// 旧客户端事件上报（不含版本号也放行，只记录，不影响使用）
+app.post('/api/report', (req, res) => {
+  const b = req.body || {};
+  console.log('[report] type=' + String(b.type || '').slice(0, 32) + ' v=' + String(b.v || '').slice(0, 16)
+    + ' platform=' + String((b.payload && b.payload.platform) || '').slice(0, 16));
+  res.json({ ok: true });
+});
+
 // 前端 POST /api/proxy/chat { provider: 'zhipu'|'openrouter'|'agnes', body: {...} }
 // 后端转发到对应 provider 的 /chat/completions，SSE 透传
 const PROXY_TARGETS = {
