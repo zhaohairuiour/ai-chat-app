@@ -407,19 +407,18 @@ if (!userCols.some(c => c.name === 'deactivate_at')) {
   db.exec('ALTER TABLE users ADD COLUMN deactivate_at INTEGER');
 }
 
-// 预置测试账号（幂等：不存在则创建；已存在则校正邮箱与密码，保证始终可登录）
+// 可选预置管理员：仅在显式设置 SEED_USER + SEED_PASSWORD 时创建（不存在则插入，不重置已有密码）
+// 默认不创建任何账号，避免源码/部署包内置默认口令。
 (function ensureSeedAccount() {
-  const seed = { username: 'zhao', password: 'zdl810916', email: 'zhaohairuiisme@163.com', nickname: 'zhao' };
-  const row = db.prepare('SELECT * FROM users WHERE username = ?').get(seed.username);
-  if (!row) {
-    const salt = crypto.randomBytes(16).toString('hex');
-    db.prepare('INSERT INTO users (username, password_hash, salt, nickname, email, created_at) VALUES (?,?,?,?,?,?)')
-      .run(seed.username, hashPassword(seed.password, salt), salt, seed.nickname, seed.email, now());
-    console.log('[seed] 预置测试账号已创建:', seed.username, '/', seed.email);
-  } else {
-    db.prepare('UPDATE users SET email=?, password_hash=? WHERE username=?')
-      .run(seed.email, hashPassword(seed.password, row.salt), seed.username);
-  }
+  const username = String(process.env.SEED_USER || '').trim();
+  const password = String(process.env.SEED_PASSWORD || '');
+  if (!username || password.length < 6) return;
+  const row = db.prepare('SELECT id FROM users WHERE username = ?').get(username);
+  if (row) return;
+  const salt = crypto.randomBytes(16).toString('hex');
+  db.prepare('INSERT INTO users (username, password_hash, salt, nickname, email, created_at) VALUES (?,?,?,?,?,?)')
+    .run(username, hashPassword(password, salt), salt, username, null, now());
+  console.log('[seed] 已创建管理员账号:', username);
 })();
 
 // ============ 游客会话（免登录直连）：服务启动即创建/复用 guest 用户与长期会话，
