@@ -14,8 +14,8 @@ const nodemailer = require('nodemailer');
 
 // ============ 邮件验证码（163 邮箱 SMTP 自动发送） ============
 // 163 邮箱授权码（网页版邮箱 → 设置 → POP3/SMTP/IMAP → 开启服务 → 新增授权码）
-const MAIL_USER = 'zhaohairuiisme@163.com';
-const MAIL_PASS = 'XJPKTrSunC4DM45T'; // 网易163授权码（非登录密码）
+const MAIL_USER = process.env.MAIL_USER || '';
+const MAIL_PASS = process.env.MAIL_PASS || ''; // 网易163授权码（非登录密码），仅从环境变量读取
 const MAIL_TRANSPORTER = MAIL_USER
   ? nodemailer.createTransport({
       host: 'smtp.163.com',
@@ -90,6 +90,7 @@ function mailResetOnChange(email) { mailCodes.delete(String(email || '').toLower
 // 上游 Provider：按顺序尝试，连不上自动切下一个；poixe 全挂时自动 fallback 到智谱
 const POIXE_KEY = process.env.POIXE_KEY || '';
 const ZHIPU_KEY = process.env.ZHIPU_KEY || ''; // 智谱开放平台，通过环境变量注入
+const ZHIPU_BASE = 'https://open.bigmodel.cn/api/paas/v4';
 const UPSTREAM_ENDPOINTS = [
   { provider: 'poixe', name: 'poixe-1',   base: 'https://api.poixe.com',                       key: POIXE_KEY, apiPath: '/v1' },
   { provider: 'poixe', name: 'poixe-2',   base: 'https://api-eu-central-1-dc8.poixe.com',      key: POIXE_KEY, apiPath: '/v1' },
@@ -373,6 +374,14 @@ CREATE TABLE IF NOT EXISTS conversations (
   created_at INTEGER NOT NULL,
   updated_at INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS quota_daily (
+  user_id    INTEGER NOT NULL,
+  day        TEXT NOT NULL,
+  spent      REAL NOT NULL DEFAULT 0,
+  calls      INTEGER NOT NULL DEFAULT 0,
+  updated_at INTEGER NOT NULL,
+  PRIMARY KEY (user_id, day)
+);
 CREATE TABLE IF NOT EXISTS messages (
   id              INTEGER PRIMARY KEY AUTOINCREMENT,
   conversation_id INTEGER NOT NULL,
@@ -444,45 +453,54 @@ function getGuestSession() {
   return { token: guestToken, user: { id: guest.id, username: guest.username, nickname: guest.nickname, email: guest.email } };
 }
 
-// ============ 付费模型每日消费额度（每日 1 元，按日期跨天重置，持久化到 data/spend.json） ============
-const SPEND_LIMIT_YUAN = 1;
-const spendFile = path.join(dataDir, 'spend.json');
-let spendState = { date: todayStr(), spent: 0, updatedAt: 0 };
-function todayStr() {
-  const d = new Date();
-  return d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0');
+// ============ 每日额度（服务端记账，所有模型含免费模型，每日 ¥1） ============
+// 日期由服务端时钟按北京时间（UTC+8）切分，客户端时间不参与，改手机时间无效。
+const QUOTA_LIMIT_YUAN = 1;
+const QUOTA_COSTS = { chat: 0.05, image_gen: 0.10, video_gen: 1.00, tts: 0.05 };
+const QUOTA_TZ_OFFSET = 8 * 3600;
+function quotaDay() {
+  const d = new Date(Date.now() + QUOTA_TZ_OFFSET * 1000);
+  return d.getUTCFullYear() + '-' + String(d.getUTCMonth() + 1).padStart(2, '0') + '-' + String(d.getUTCDate()).padStart(2, '0');
 }
-try {
-  if (fs.existsSync(spendFile)) {
-    const j = JSON.parse(fs.readFileSync(spendFile, 'utf8'));
-    if (j && typeof j.spent === 'number' && isFinite(j.spent)) spendState = j;
+function quotaState(userId) {
+  const day = quotaDay();
+  const row = db.prepare('SELECT spent, calls FROM quota_daily WHERE user_id = ? AND day = ?').get(userId, day);
+  const spent = row ? Number(row.spent) || 0 : 0;
+  const calls = row ? Number(row.calls) || 0 : 0;
+  return {
+    day, spent: Math.round(spent * 1e6) / 1e6, calls,
+    limit: QUOTA_LIMIT_YUAN,
+    remaining: Math.max(0, Math.round((QUOTA_LIMIT_YUAN - spent) * 1e6) / 1e6),
+    costs: QUOTA_COSTS,
+  };
+}
+function quotaCharge(userId, kind) {
+  const fee = QUOTA_COSTS[kind];
+  if (!(fee > 0)) return { ok: false, error: '未知的计费类型: ' + kind, quota: quotaState(userId) };
+  const day = quotaDay();
+  const row = db.prepare('SELECT spent, calls FROM quota_daily WHERE user_id = ? AND day = ?').get(userId, day);
+  const spent = row ? Number(row.spent) || 0 : 0;
+  if (spent + fee > QUOTA_LIMIT_YUAN + 1e-9) {
+    return { ok: false, error: '今日额度不足：本次 ¥' + fee.toFixed(2) + '，剩余 ¥' + Math.max(0, QUOTA_LIMIT_YUAN - spent).toFixed(2), quota: quotaState(userId) };
   }
-} catch (_) {}
-function saveSpend() {
-  try {
-    spendState.updatedAt = now();
-    fs.writeFileSync(spendFile, JSON.stringify(spendState, null, 2));
-  } catch (e) { console.log('[spend] 写入失败:', e.message); }
+  const next = Math.round((spent + fee) * 1e6) / 1e6;
+  db.prepare(`INSERT INTO quota_daily (user_id, day, spent, calls, updated_at) VALUES (?,?,?,?,?)
+    ON CONFLICT(user_id, day) DO UPDATE SET spent = excluded.spent, calls = excluded.calls, updated_at = excluded.updated_at`)
+    .run(userId, day, next, (row ? Number(row.calls) || 0 : 0) + 1, now());
+  console.log('[quota] user=' + userId + ' ' + kind + ' +¥' + fee + ' → ¥' + next + '/¥' + QUOTA_LIMIT_YUAN + ' (' + day + ')');
+  return { ok: true, fee, quota: quotaState(userId) };
 }
-// 当日已消费金额；跨天则自动重置为 0
-function getSpent() {
-  if (spendState.date !== todayStr()) { spendState.date = todayStr(); spendState.spent = 0; saveSpend(); }
-  return spendState.spent || 0;
-}
-// 估算单次费用（元）：输入/输出 tokens × 模型单价（元/百万 tokens）
-function estimateCost(meta, usage) {
-  if (!meta || !meta.price || !usage) return 0;
-  const prompt = Number(usage.prompt_tokens || usage.input_tokens || 0);
-  const completion = Number(usage.completion_tokens || usage.output_tokens || 0);
-  // 缓存命中按缓存价（约输入价的 1/4 折算，保守简化为统一按标准输入价计费，绝不低估）
-  return (prompt * meta.price.in + completion * meta.price.out) / 1e6;
-}
-function addSpent(yuan) {
-  if (!(yuan > 0)) return;
-  if (spendState.date !== todayStr()) { spendState.date = todayStr(); spendState.spent = 0; }  // 跨天重置
-  spendState.spent = Math.round((getSpent() + yuan) * 1e6) / 1e6;
-  saveSpend();
-  console.log('[spend] 本次 ¥' + yuan.toFixed(4) + '，今日 ¥' + getSpent().toFixed(4) + ' / ¥' + SPEND_LIMIT_YUAN + '（' + spendState.date + '）');
+function quotaRefund(userId, kind) {
+  const fee = QUOTA_COSTS[kind];
+  if (!(fee > 0)) return quotaState(userId);
+  const day = quotaDay();
+  const row = db.prepare('SELECT spent, calls FROM quota_daily WHERE user_id = ? AND day = ?').get(userId, day);
+  if (!row) return quotaState(userId);
+  const spent = Math.max(0, Math.round((Number(row.spent) - fee) * 1e6) / 1e6);
+  const calls = Math.max(0, (Number(row.calls) || 0) - 1);
+  db.prepare('UPDATE quota_daily SET spent = ?, calls = ?, updated_at = ? WHERE user_id = ? AND day = ?')
+    .run(spent, calls, now(), userId, day);
+  return quotaState(userId);
 }
 
 // ============ 工具函数 ============
@@ -563,16 +581,24 @@ const PROXY_TARGETS = {
   openrouter: { base: 'https://openrouter.ai/api/v1',         key: process.env.OPENROUTER_KEY || '' },
   agnes:      { base: 'https://api.agnes.ai/v1',              key: process.env.AGNES_KEY || '' },
 };
-app.post('/api/proxy/chat', async (req, res) => {
+app.post('/api/proxy/chat', requireAuth, async (req, res) => {
+  let charged = false;
   try {
     const { provider, body } = req.body || {};
     const t = PROXY_TARGETS[provider];
     if (!t) return res.status(400).json({ error: 'unknown provider: ' + provider });
+    const q = quotaCharge(req.user.id, 'chat');
+    if (!q.ok) return res.status(402).json({ error: q.error, quota: q.quota });
+    charged = true;
     const upstream = await fetch(t.base + '/chat/completions', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + t.key },
       body: JSON.stringify(body),
     });
+    if (upstream.status >= 400) {
+      quotaRefund(req.user.id, 'chat');
+      charged = false;
+    }
     res.status(upstream.status);
     upstream.headers.forEach((v, k) => {
       if (!['content-encoding', 'transfer-encoding', 'connection'].includes(k)) res.setHeader(k, v);
@@ -586,7 +612,52 @@ app.post('/api/proxy/chat', async (req, res) => {
     }
     res.end();
   } catch (e) {
-    res.status(502).json({ error: 'proxy failed: ' + e.message });
+    if (charged) quotaRefund(req.user.id, 'chat');
+    if (!res.headersSent) res.status(502).json({ error: 'proxy failed: ' + e.message });
+    else try { res.end(); } catch (_) {}
+  }
+});
+
+// 智谱图片/视频/语音代理：服务端持有 Key、鉴权并记账；客户端不再直连、不再内嵌密钥
+// POST /api/proxy/zhipu { path: '/images/generations', method: 'POST', body: {...} }
+app.post('/api/proxy/zhipu', requireAuth, async (req, res) => {
+  let chargedKind = null;
+  try {
+    const { path: zpath, method, body } = req.body || {};
+    if (typeof zpath !== 'string' || !zpath.startsWith('/')) return res.status(400).json({ error: 'invalid path' });
+    const m = (method === 'GET' ? 'GET' : 'POST');
+    let kind = null;
+    if (zpath.includes('/images/')) kind = 'image_gen';
+    else if (zpath.includes('/videos/')) kind = 'video_gen';
+    else if (zpath.includes('/audio/')) kind = 'tts';
+    if (kind) {
+      const q = quotaCharge(req.user.id, kind);
+      if (!q.ok) return res.status(402).json({ error: q.error, quota: q.quota });
+      chargedKind = kind;
+    }
+    const upstream = await fetch(ZHIPU_BASE + zpath, {
+      method: m,
+      headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + ZHIPU_KEY },
+      ...(m === 'GET' ? {} : { body: JSON.stringify(body || {}) }),
+    });
+    if (upstream.status >= 400) {
+      if (chargedKind) quotaRefund(req.user.id, chargedKind);
+      chargedKind = null;
+    }
+    const ct = upstream.headers.get('content-type') || '';
+    res.status(upstream.status);
+    if (ct.includes('application/json') || ct.includes('text/')) {
+      const text = await upstream.text();
+      res.setHeader('Content-Type', ct || 'application/json');
+      return res.send(text);
+    }
+    const buf = Buffer.from(await upstream.arrayBuffer());
+    res.setHeader('Content-Type', ct || 'application/octet-stream');
+    return res.send(buf);
+  } catch (e) {
+    if (chargedKind) quotaRefund(req.user.id, chargedKind);
+    if (!res.headersSent) res.status(502).json({ error: 'zhipu proxy failed: ' + e.message });
+    else try { res.end(); } catch (_) {}
   }
 });
 
@@ -620,20 +691,22 @@ app.post('/api/register', (req, res) => {
   if (!username || !password || String(username).length < 3 || String(password).length < 6) {
     return res.status(400).json({ error: '用户名至少 3 位，密码至少 6 位' });
   }
+  // 邮箱可选：不填邮箱则仅用用户名+密码注册（部署方无需配置 SMTP 也能开户）；
+  // 填了邮箱则必须通过邮箱验证码，且邮箱全局唯一。
   const emailVal = String(email || '').trim().toLowerCase();
-  if (!EMAIL_RE.test(emailVal)) {
-    return res.status(400).json({ error: '注册必须绑定有效邮箱' });
+  if (emailVal) {
+    if (!EMAIL_RE.test(emailVal)) return res.status(400).json({ error: '邮箱格式不正确' });
+    const v = verifyMailCode(emailVal, 'register', code);
+    if (!v.ok) return res.status(400).json({ error: v.error });
+    const emailExists = db.prepare('SELECT id FROM users WHERE email = ?').get(emailVal);
+    if (emailExists) return res.status(409).json({ error: '该邮箱已被绑定' });
   }
-  const v = verifyMailCode(emailVal, 'register', code);
-  if (!v.ok) return res.status(400).json({ error: v.error });
-  const emailExists = db.prepare('SELECT id FROM users WHERE email = ?').get(emailVal);
-  if (emailExists) return res.status(409).json({ error: '该邮箱已被绑定' });
   const salt = crypto.randomBytes(16).toString('hex');
   const hash = hashPassword(String(password), salt);
   try {
     const info = db.prepare(
       'INSERT INTO users (username, password_hash, salt, nickname, email, created_at) VALUES (?,?,?,?,?,?)'
-    ).run(String(username).trim(), hash, salt, String(nickname || username).trim(), emailVal, now());
+    ).run(String(username).trim(), hash, salt, String(nickname || username).trim(), emailVal || null, now());
     const userId = info.lastInsertRowid;
     const token = newToken();
     db.prepare('INSERT INTO sessions (token, user_id, expires_at) VALUES (?,?,?)')
@@ -696,6 +769,7 @@ app.get('/api/me', (req, res) => {
     id: user.id, username: user.username, nickname: user.nickname, email: user.email,
     deactivating: !!user.deactivate_at,
     deactivateAt: user.deactivate_at || null,
+    quota: quotaState(user.id),
   });
 });
 
@@ -716,6 +790,16 @@ app.get('/api/guest', (req, res) => {
   const g = getGuestSession();
   res.setHeader('Set-Cookie', `token=${g.token}; HttpOnly; Path=/; Max-Age=${SESSION_TTL_MS/1000}; SameSite=Lax`);
   res.json({ id: g.user.id, username: g.user.username, nickname: g.user.nickname, email: g.user.email, guest: true, token: g.token });
+});
+
+app.get('/api/quota', requireAuth, (req, res) => {
+  res.json(quotaState(req.user.id));
+});
+app.post('/api/quota/charge', requireAuth, (req, res) => {
+  const kind = String((req.body && req.body.kind) || '');
+  const r = quotaCharge(req.user.id, kind);
+  if (!r.ok) return res.status(402).json({ error: r.error, quota: r.quota });
+  res.json({ ok: true, fee: r.fee, quota: r.quota });
 });
 
 app.post('/api/profile', requireAuth, (req, res) => {
@@ -1817,12 +1901,12 @@ app.post('/api/chat', requireAuth, async (req, res) => {
   const { provider, apiModel, fallbackModel } = resolveModelProvider(chatModel);
   const zhipuMeta = provider === 'zhipu' ? (ZHIPU_MODELS.find(m => m.id === chatModel) || null) : null;
   const supportsThinking = !!zhipuMeta && zhipuMeta.caps.includes('think');
-  // 付费模型每日额度（1 元）：超额直接拒绝，提示切换免费模型
-  const isPaidZhipu = !!zhipuMeta && !zhipuMeta.free && zhipuMeta.price;
-  if (isPaidZhipu && getSpent() >= SPEND_LIMIT_YUAN) {
+  // 每日额度（¥1）：免费与付费模型统一计量，超额一律拒绝（端上也有同样的本地计量）
+  const meteredZhipu = !!zhipuMeta && (zhipuMeta.free || (zhipuMeta.price && !zhipuMeta.free));
+  if (meteredZhipu && getSpent() >= SPEND_LIMIT_YUAN) {
     send('error', {
       status: 402,
-      message: '付费模型今日额度已达 ¥' + SPEND_LIMIT_YUAN + ' 上限（今日已用 ¥' + getSpent().toFixed(2) + '），请切换至免费模型（如 GLM-4.7-Flash）'
+      message: '今日额度已达 ¥' + SPEND_LIMIT_YUAN + ' 上限（今日已用 ¥' + getSpent().toFixed(2) + '，含免费模型），明日 0 点自动重置'
     });
     return res.end();
   }
@@ -2075,13 +2159,16 @@ app.post('/api/chat', requireAuth, async (req, res) => {
     return res.end();
   }
 
-  // 付费与免费智谱模型统一计量：免费模型按象征性单价累加，避免额度长期为 0 无法观测用量
+  // 免费与付费智谱模型统一计量：免费模型按象征单价累加，并设每次最低 ¥0.05，保证额度可见、可拦截
   let spendInfo = null;
   const FREE_MODEL_PRICE = { in: 1, out: 2 };   // 元/百万 token（免费模型象征性计价）
+  const FREE_MODEL_MIN_FEE = 0.05;              // 免费模型每次最低计费（约 20 次/日）
   try {
-    const billMeta = zhipuMeta ? (zhipuMeta.free ? { price: FREE_MODEL_PRICE } : zhipuMeta) : null;
-    if (billMeta && lastUsage) {
-      const cost = estimateCost(billMeta, lastUsage);
+    const isFreeZhipu = !!zhipuMeta && !!zhipuMeta.free;
+    const billMeta = zhipuMeta ? (isFreeZhipu ? { price: FREE_MODEL_PRICE } : zhipuMeta) : null;
+    if (billMeta && (lastUsage || isFreeZhipu)) {
+      const raw = estimateCost(billMeta, lastUsage);
+      const cost = isFreeZhipu ? Math.max(raw, FREE_MODEL_MIN_FEE) : raw;
       if (cost > 0) {
         addSpent(cost);
         const r6 = (n) => Math.round(n * 1e6) / 1e6;

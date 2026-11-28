@@ -1,11 +1,11 @@
 {
-  "versionName": "3.32.106",
-  "versionCode": 460,
-  "apkUrl": "https://github.com/zhaohairuiour/ai-chat-app/releases/download/v3.32.106/ai-chat-app-v3.32.106-full-nokeys.apk",
-  "apkUrlLite": "https://github.com/zhaohairuiour/ai-chat-app/releases/download/v3.32.106/ai-chat-app-v3.32.106-lite-nokeys.apk",
+  "versionName": "3.32.107",
+  "versionCode": 461,
+  "apkUrl": "https://github.com/zhaohairuiour/ai-chat-app/releases/download/v3.32.107/ai-chat-app-v3.32.107-full-nokeys.apk",
+  "apkUrlLite": "https://github.com/zhaohairuiour/ai-chat-app/releases/download/v3.32.107/ai-chat-app-v3.32.107-lite-nokeys.apk",
   "apkSize": 276371211,
-  "apkSizeLite": 4454006,
-  "notes": "额度费率：对话 ¥0.05/次、绘图 ¥0.10/张、视频 ¥1.00/条、语音 ¥0.05/次，每日 ¥1；切日改用公共网络授时（北京时间 0 点），修改设备时间无法重置额度。",
+  "apkSizeLite": 4458102,
+  "notes": "新增账号体系与服务端记账：注册/登录、Bearer 令牌鉴权；每日 ¥1 额度按用户+按天写入服务端 SQLite，按北京时间 0 点切日，改手机时间无效；对话 ¥0.05、绘图 ¥0.10、视频 ¥1.00、语音 ¥0.05，全部经服务端代理并预扣，失败自动退款。登录页新增服务器地址配置。",
   "force": false,
   "publishedAt": "2026-11-28"
 }

@@ -23,11 +23,18 @@ const AGNES_KEY = '';
 const AGNES_BASE = 'https://api.agnes.ai/v1';
 // 后端上报地址（封禁/状态事件；为空则跳过上报，APK 离线可用）
 // 优先读取菜单/历史版本写入的 apiBase，避免 APK 内所有代理请求都打到 https://localhost
-const BACKEND_BASE = (() => {
+function backendBase() {
   try { return String(localStorage.getItem('apiBase') || '').replace(/\/+$/, ''); } catch (_) { return ''; }
-})();
-// API 代理地址（避免 WebView CORS，所有模型请求走后端转发）
-const PROXY_BASE = BACKEND_BASE + '/api/proxy/chat';
+}
+function authHeader() {
+  try {
+    const a = JSON.parse(localStorage.getItem('aichat_auth_v1') || 'null');
+    return a && a.token ? { 'Authorization': 'Bearer ' + a.token } : {};
+  } catch (_) { return {}; }
+}
+// API 代理地址（动态读取，登录页修改服务器后无需刷新）
+function proxyUrl(path) { return backendBase() + path; }
+function proxyHeaders() { return { 'Content-Type': 'application/json', ...authHeader() }; }
 // 本地数据加密密钥（AES-GCM + HMAC）：每台设备首次运行时随机生成 64 字节并持久化，
 // APK 内不再内置固定密钥。LEGACY_SECRET_HEX 仅在解密升级前的历史数据时用作兼容回退，
 // 新旧数据读取成功后会自动用设备密钥重新加密（迁移）。
@@ -421,8 +428,8 @@ function abortError() {
 
 // 非流式请求统一走 /api/proxy/chat，避免去 Key 后直连空密钥必然 401
 async function proxyChatOnce(provider, body, signal) {
-  const res = await fetchWithRetry(PROXY_BASE, {
-    method: 'POST', headers: { 'Content-Type': 'application/json' },
+  const res = await fetchWithRetry(proxyUrl('/api/proxy/chat'), {
+    method: 'POST', headers: proxyHeaders(),
     body: JSON.stringify({ provider, body }), signal,
   });
   const j = await res.json().catch(() => ({}));
@@ -442,8 +449,9 @@ async function proxyChatOnce(provider, body, signal) {
 }
 
 async function zhipuPost(path, body, signal) {
-  const res = await fetchWithRetry(ZHIPU_BASE + path, {
-    method: 'POST', headers: ZHIPU_HEADERS, body: JSON.stringify(body), signal,
+  // 图片/视频/语音统一走服务端代理：服务端持有 Key、鉴权并按次记账
+  const res = await fetchWithRetry(proxyUrl('/api/proxy/zhipu'), {
+    method: 'POST', headers: proxyHeaders(), body: JSON.stringify({ path, body }), signal,
   });
   if (!res.ok) {
     const j = await res.json().catch(() => ({}));
@@ -518,8 +526,8 @@ async function zhipuChatStream({ model, messages, max_tokens, thinking, onDelta,
   // 视觉模型不支持 thinking 参数，带上会被判 1210 参数非法
   if (thinking && !vision) reqBody.thinking = { type: 'enabled' };
   // 走后端代理避免 CORS
-  const res = await fetchWithRetry(PROXY_BASE, {
-    method: 'POST', headers: { 'Content-Type': 'application/json' },
+  const res = await fetchWithRetry(proxyUrl('/api/proxy/chat'), {
+    method: 'POST', headers: proxyHeaders(),
     body: JSON.stringify({ provider: 'zhipu', body: reqBody }), signal,
   });
   if (!res.ok) {
@@ -575,7 +583,10 @@ async function zhipuVideoCreate(model, prompt) {
   return await res.json();
 }
 async function zhipuVideoResult(id) {
-  const res = await fetch(ZHIPU_BASE + '/async-result/' + id, { headers: ZHIPU_HEADERS });
+  const res = await fetch(proxyUrl('/api/proxy/zhipu'), {
+    method: 'POST', headers: proxyHeaders(),
+    body: JSON.stringify({ path: '/async-result/' + id, method: 'GET' }),
+  });
   return await res.json();
 }
 // 非流式一次性调用（项目编排用）：走代理，非直连空密钥
@@ -616,8 +627,8 @@ async function openaiCompatStream({ base, key, model, messages, max_tokens, thin
   let provider = 'openrouter';
   if (base.indexOf('agnes') >= 0) provider = 'agnes';
   else if (base.indexOf('openrouter') >= 0) provider = 'openrouter';
-  const res = await fetchWithRetry(PROXY_BASE, {
-    method: 'POST', headers: { 'Content-Type': 'application/json' },
+  const res = await fetchWithRetry(proxyUrl('/api/proxy/chat'), {
+    method: 'POST', headers: proxyHeaders(),
     body: JSON.stringify({ provider, body }), signal,
   });
   if (!res.ok) {
@@ -922,9 +933,10 @@ try {
 
 // 后端上报（封禁/状态/异常事件；BACKEND_BASE 为空则静默跳过）
 async function reportEvent(type, payload) {
-  if (!BACKEND_BASE) return;
+  const BASE = backendBase();
+  if (!BASE) return;
   try {
-    await fetch(BACKEND_BASE.replace(/\/$/, '') + '/api/report', {
+    await fetch(BASE + '/api/report', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ type, payload: payload || {}, ts: Date.now(), app: 'com.aichat.app', v: '3.27' }),

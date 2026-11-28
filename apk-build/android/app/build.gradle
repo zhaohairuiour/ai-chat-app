@@ -7,13 +7,31 @@ android {
         applicationId "com.aichat.app"
         minSdkVersion rootProject.ext.minSdkVersion
         targetSdkVersion rootProject.ext.targetSdkVersion
-        versionCode 456
-        versionName "3.32.102"
+        versionCode 461
+        versionName "3.32.107"
         testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
         aaptOptions {
              // Files and dirs to omit from the packaged assets dir, modified to accommodate modern web apps.
              // Default: https://android.googlesource.com/platform/frameworks/base/+/282e181b58cf72b6ca770dc7ca5f91f135444502/tools/aapt/AaptAssets.cpp#61
             ignoreAssetsPattern = '!.svn:!.git:!.ds_store:!*.scc:.*:!CVS:!thumbs.db:!picasa.ini:!*~'
+        }
+    }
+    // v3.32.104：拆成两个发行变体
+    //   full：内置 Termux bootstrap + OpenClaw 运行时，装完即可断网使用（包体大）
+    //   lite：不内置运行环境，首次使用按需从 GitHub Release 下载（包体小，需联网）
+    flavorDimensions += "runtime"
+    productFlavors {
+        full {
+            dimension "runtime"
+        }
+        lite {
+            dimension "runtime"
+        }
+    }
+    sourceSets {
+        // 大体积 zip 放在 apk-build/runtime-assets，只有 full 变体打进 APK
+        full {
+            assets.srcDirs += rootProject.file('../runtime-assets')
         }
     }
     buildTypes {

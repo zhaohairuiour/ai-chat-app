@@ -6,10 +6,10 @@
   <title>AI 助手</title>
   <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
   <link rel="apple-touch-icon" href="/favicon.svg" />
-  <link rel="stylesheet" href="/style.css?v=3.32.102" />
+  <link rel="stylesheet" href="/style.css?v=3.32.107" />
   <link rel="stylesheet" href="/vendor/github-dark.min.css" />
   <script src="/vendor/marked.min.js"></script>
-  <script src="/vendor/highlight.min.js"></script>
+  <!-- highlight.min.js 121KB 改为 app.js 内按需异步加载，不再阻塞首屏 -->
 </head>
 <body>
   <!-- 登录/注册 -->
@@ -17,35 +17,19 @@
     <div class="auth-card">
       <div class="auth-logo"><svg class="icon" viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3l1.9 5.8 5.8 1.9-5.8 1.9L12 18.5l-1.9-5.9L4.3 10.7l5.8-1.9L12 3z"/><path d="M19 15l.9 2.6 2.6.9-2.6.9L19 22l-.9-2.6-2.6-.9 2.6-.9L19 15z"/></svg> AI 助手</div>
       <div class="auth-tabs">
-        <button class="auth-tab active" data-mode="login">登录</button>
-        <button class="auth-tab" data-mode="register">注册</button>
+        <button type="button" class="auth-tab active" data-mode="login">登录</button>
+        <button type="button" class="auth-tab" data-mode="register">注册</button>
       </div>
-      <form id="auth-form">
-        <input type="text" id="auth-username" placeholder="用户名或邮箱" autocomplete="username" required />
-        <input type="email" id="auth-email" placeholder="邮箱（注册必填，用于接收验证码）" class="hidden" autocomplete="email" />
-        <div class="field-hint hidden" id="auth-email-hint"></div>
-        <input type="password" id="auth-password" placeholder="密码" autocomplete="current-password" required />
-        <input type="password" id="auth-password2" placeholder="确认密码（注册时填）" class="hidden" autocomplete="new-password" />
-        <div class="field-hint hidden" id="auth-pwd-hint"></div>
-        <!-- 注册：邮箱验证码 -->
-        <div class="code-row hidden" id="reg-code-row">
-          <input type="text" id="auth-code" placeholder="6 位邮箱验证码" inputmode="numeric" maxlength="6" autocomplete="one-time-code" />
-          <button type="button" class="code-btn" id="btn-send-code">发送验证码</button>
-        </div>
+      <form id="auth-form" novalidate>
+        <input type="url" id="auth-server" placeholder="服务器地址，如 https://api.example.com" autocomplete="url" spellcheck="false" />
+        <input type="text" id="auth-username" placeholder="用户名" autocomplete="username" required />
+        <input type="password" id="auth-password" placeholder="密码（至少 6 位）" autocomplete="current-password" required />
+        <input type="password" id="auth-password2" placeholder="确认密码" class="hidden" autocomplete="new-password" />
         <div class="auth-error" id="auth-error"></div>
         <button type="submit" class="btn-primary" id="auth-submit">登 录</button>
-        <!-- 登录：邮箱验证码快捷登录 -->
-        <div class="mail-login" id="mail-login">
-          <div class="mail-login-divider"><span>或使用邮箱验证码登录</span></div>
-          <input type="email" id="mail-login-email" placeholder="已绑定邮箱（验证码登录）" autocomplete="email" />
-          <div class="code-row">
-            <input type="text" id="mail-login-code" placeholder="6 位邮箱验证码" inputmode="numeric" maxlength="6" autocomplete="one-time-code" />
-            <button type="button" class="code-btn" id="btn-send-login-code">发送验证码</button>
-          </div>
-          <button type="button" class="btn-primary btn-mail-login" id="btn-mail-login">验证码登录</button>
-        </div>
         <button type="button" class="guest-btn hidden" id="btn-guest">使用本地账号进入</button>
       </form>
+      <div class="auth-note">账号用于在服务端记录每日 ¥1 额度，换设备登录额度同步；额度按服务器时间每日 0 点重置。</div>
     </div>
   </div>
 
@@ -362,8 +346,8 @@
     </div>
   </div>
 
-  <script src="/local-core.js?v=3.32.102"></script>
-  <script>window.__APP_VER="3.32.102";</script>
-  <script src="/app.js?v=3.32.102"></script>
+  <script src="/local-core.js?v=3.32.107"></script>
+  <script>window.__APP_VER="3.32.107";</script>
+  <script src="/app.js?v=3.32.107"></script>
 </body>
 </html>

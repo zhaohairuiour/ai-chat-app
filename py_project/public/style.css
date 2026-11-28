@@ -54,6 +54,8 @@ svg.icon { display: inline-block; vertical-align: -2px; }
 }
 .auth-card input:focus { border-color: var(--primary); }
 .auth-error { color: var(--red); font-size: 13px; min-height: 18px; margin-bottom: 8px; }
+.auth-note { color: #8b96a8; font-size: 12px; line-height: 1.6; margin-top: 14px; text-align: center; }
+.auth-card #auth-server { font-size: 12px; }
 /* 字段级实时校验提示 */
 .field-hint { font-size: 12px; min-height: 16px; margin: -6px 2px 8px; line-height: 1.4; color: var(--red); }
 .field-hint.ok { color: var(--green); }
