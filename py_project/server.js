@@ -611,7 +611,7 @@ app.use(express.json({ limit: '40mb' })); // 多模态附件（图片/文件 bas
 app.use(express.static(path.join(__dirname, 'public')));
 
 // ---- 版本上报 / 校验 ----
-const VERSION_EXEMPT = new Set(['/api/app/version', '/api/app/version/report', '/api/report']);
+const VERSION_EXEMPT = new Set(['/api/app/version', '/api/app/version/report', '/api/report', '/api/health']);
 function normalizeVersionCode(v) {
   const n = Number(v);
   return Number.isInteger(n) && n > 0 && n < 1e9 ? n : 0;
