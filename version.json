@@ -1,8 +1,11 @@
 {
-  "versionName": "3.32.102",
-  "versionCode": 456,
-  "apkUrl": "https://github.com/zhaohairuiour/ai-chat-app/releases/download/v3.32.102/ai-chat-app-v3.32.102-nokeys.apk",
-  "notes": "修复自动执行失效、重试重复写入、串流切会话错写、停止被 fallback 吞掉、终端标签关闭异常、字号设置无效、启动覆盖备份等 13 项缺陷。",
+  "versionName": "3.32.104",
+  "versionCode": 458,
+  "apkUrl": "https://github.com/zhaohairuiour/ai-chat-app/releases/download/v3.32.104/ai-chat-app-v3.32.104-full-nokeys.apk",
+  "apkUrlLite": "https://github.com/zhaohairuiour/ai-chat-app/releases/download/v3.32.104/ai-chat-app-v3.32.104-lite-nokeys.apk",
+  "apkSize": 276387595,
+  "apkSizeLite": 4470390,
+  "notes": "拆分完整版与轻量版（轻量版运行环境首次使用按需下载）；流式渲染自适应节流、启动异步加载高亮、终端回显唤醒、历史会话批量挂载等性能优化。",
   "force": false,
-  "publishedAt": "2026-11-22"
+  "publishedAt": "2026-11-28"
 }
