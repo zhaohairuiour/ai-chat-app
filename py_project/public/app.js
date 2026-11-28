@@ -472,7 +472,7 @@ async function refreshSpendDisplay() {
   const line = $('spend-line');
   if (!line) return;
   try {
-    const q = quotaCache || await fetchQuota();
+    const q = await fetchQuota();
     const limit = Number(q.limit) || 1;
     const spent = Number(q.spent) || 0;
     const pct = Math.min(100, Math.round(spent / limit * 100));
